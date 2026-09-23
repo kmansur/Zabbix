@@ -64,4 +64,27 @@ grep -Fq '/usr/local/scripts/zabbix-package-updates' "${USERPARAMETER}" ||
 grep -Fq '/usr/local/scripts/zabbix-package-updates ""' "${SUDOERS_EXAMPLE}" ||
     fail 'sudoers example does not restrict the collector to an empty argument list'
 
+
+for template in \
+    "${PROJECT_ROOT}/templates/7.0/template_linux_package_updates.yaml" \
+    "${PROJECT_ROOT}/templates/8.0/template_linux_package_updates.yaml"
+do
+    grep -q '^      groups:
+ "${template}" ||
+        fail "template groups block is not at template scope: ${template}"
+    grep -q '^      items:
+ "${template}" ||
+        fail "template items block is not at template scope: ${template}"
+    if grep -q '^          items:
+ "${template}"; then
+        fail "template items block is incorrectly nested inside groups: ${template}"
+    fi
+    grep -q '^      tags:
+ "${template}" ||
+        fail "template tags block is not at template scope: ${template}"
+    grep -q '^      macros:
+ "${template}" ||
+        fail "template macros block is not at template scope: ${template}"
+done
+
 printf 'All core tests passed.\n'
