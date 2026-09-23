@@ -1,0 +1,20 @@
+# zabbix-package-updates configuration
+#
+# This project is monitoring-only in the current release.
+# Remediation switches are reserved and MUST remain disabled.
+
+CHECK_ENABLED=yes
+REFRESH_ENABLED=yes
+
+# Repository metadata refresh interval in seconds.
+# Default: 21600 (6 hours)
+REFRESH_INTERVAL=21600
+
+# Maximum execution time for package-manager commands in seconds.
+COMMAND_TIMEOUT=120
+
+# Reserved for future releases. Enabling any of these values causes
+# the current collector to fail closed.
+APPLY_SECURITY_ENABLED=no
+APPLY_ALL_ENABLED=no
+AUTO_REBOOT=no
