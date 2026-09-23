@@ -19,203 +19,203 @@ zabbix_export:
       groups:
         - name: 'Templates/Operating systems'
 
-          items:
-            - uuid: edce7615dc56418ca970c7a0d1f81de1
-              name: 'Package updates: Raw data'
-              key: linux.package.updates
-              delay: 15m
-              history: 1d
-              value_type: TEXT
-              description: 'Normalized JSON returned by the local zabbix-package-updates collector.'
-              tags:
-                - tag: component
-                  value: package-updates
-                - tag: component
-                  value: raw
-            - uuid: 2d3cf40f9aba4bf584c01f41b6047f48
-              name: 'Package updates: Collector status'
-              type: DEPENDENT
-              key: linux.package.updates.status
-              value_type: CHAR
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.status
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-            - uuid: 250a97280fad48e3bed24f6cebd6ad9c
-              name: 'Package updates: Available updates'
-              type: DEPENDENT
-              key: linux.package.updates.total
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.updates.total
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-              triggers:
-                - uuid: e44923d5f65d463d85c998abdad46dbc
-                  expression: 'last(/Linux package updates by Zabbix agent/linux.package.updates.total)>={$PACKAGE.UPDATES.WARN}'
-                  name: 'Linux: Package updates are available'
-                  priority: INFO
-                  description: 'One or more package updates are available according to the configured threshold.'
-                  tags:
-                    - tag: scope
-                      value: notice
-            - uuid: dc92cf4d9d584b35b49d9e053f5e1d2b
-              name: 'Package updates: Security updates'
-              type: DEPENDENT
-              key: linux.package.updates.security
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.updates.security
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-                - tag: component
-                  value: security
-              triggers:
-                - uuid: c6d11bff80d64560948b248955311437
-                  expression: 'last(/Linux package updates by Zabbix agent/linux.package.updates.security)>={$PACKAGE.UPDATES.SECURITY.WARN}'
-                  name: 'Linux: Security package updates are available'
-                  priority: WARNING
-                  description: 'One or more security-related package updates are available according to the configured threshold.'
-                  tags:
-                    - tag: scope
-                      value: security
-            - uuid: 9498d9a83d494536996e9df2d27740d9
-              name: 'Package updates: Security detection status'
-              type: DEPENDENT
-              key: linux.package.updates.security_detection
-              value_type: CHAR
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.updates.security_detection
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-                - tag: component
-                  value: security
-            - uuid: 5952c951505c4b4e88ecc93af6c2e539
-              name: 'Package updates: Package manager'
-              type: DEPENDENT
-              key: linux.package.updates.manager
-              value_type: CHAR
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.package_manager
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-            - uuid: 3bc841ee4c30427f8faacb9a1794dc97
-              name: 'Package updates: Distribution'
-              type: DEPENDENT
-              key: linux.package.updates.distribution
-              value_type: CHAR
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.distribution.name
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-            - uuid: 02b75ff11db74c8abda6616aee864844
-              name: 'Package updates: Distribution version'
-              type: DEPENDENT
-              key: linux.package.updates.distribution_version
-              value_type: CHAR
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.distribution.version
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-            - uuid: 2aaa41ab8bf5490eb0d47f8d790cf22f
-              name: 'Package updates: Reboot required'
-              type: DEPENDENT
-              key: linux.package.updates.reboot_required
-              value_type: CHAR
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.reboot_required
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-            - uuid: 87c8cae73dcd4476a28dbda156c39737
-              name: 'Package updates: Reboot detection status'
-              type: DEPENDENT
-              key: linux.package.updates.reboot_detection
-              value_type: CHAR
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.reboot_detection
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-            - uuid: ae18c5df5cdb472ba600a71ce41ada42
-              name: 'Package updates: Last repository refresh'
-              type: DEPENDENT
-              key: linux.package.updates.last_refresh
-              units: unixtime
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.last_refresh
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
-            - uuid: 72a0bb5729b848d5903391d2f2ec20f1
-              name: 'Package updates: Last check'
-              type: DEPENDENT
-              key: linux.package.updates.last_check
-              units: unixtime
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - $.last_check
-              master_item:
-                key: linux.package.updates
-              tags:
-                - tag: component
-                  value: package-updates
+      items:
+        - uuid: edce7615dc56418ca970c7a0d1f81de1
+          name: 'Package updates: Raw data'
+          key: linux.package.updates
+          delay: 15m
+          history: 1d
+          value_type: TEXT
+          description: 'Normalized JSON returned by the local zabbix-package-updates collector.'
           tags:
-            - tag: class
-              value: software
-            - tag: target
-              value: linux
-          macros:
-            - macro: '{$PACKAGE.UPDATES.WARN}'
-              value: '1'
-              description: 'Minimum number of available package updates that generates an informational problem.'
-            - macro: '{$PACKAGE.UPDATES.SECURITY.WARN}'
-              value: '1'
-              description: 'Minimum number of security package updates that generates a warning.'
+            - tag: component
+              value: package-updates
+            - tag: component
+              value: raw
+        - uuid: 2d3cf40f9aba4bf584c01f41b6047f48
+          name: 'Package updates: Collector status'
+          type: DEPENDENT
+          key: linux.package.updates.status
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.status
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+        - uuid: 250a97280fad48e3bed24f6cebd6ad9c
+          name: 'Package updates: Available updates'
+          type: DEPENDENT
+          key: linux.package.updates.total
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.updates.total
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+          triggers:
+            - uuid: e44923d5f65d463d85c998abdad46dbc
+              expression: 'last(/Linux package updates by Zabbix agent/linux.package.updates.total)>={$PACKAGE.UPDATES.WARN}'
+              name: 'Linux: Package updates are available'
+              priority: INFO
+              description: 'One or more package updates are available according to the configured threshold.'
+              tags:
+                - tag: scope
+                  value: notice
+        - uuid: dc92cf4d9d584b35b49d9e053f5e1d2b
+          name: 'Package updates: Security updates'
+          type: DEPENDENT
+          key: linux.package.updates.security
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.updates.security
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+            - tag: component
+              value: security
+          triggers:
+            - uuid: c6d11bff80d64560948b248955311437
+              expression: 'last(/Linux package updates by Zabbix agent/linux.package.updates.security)>={$PACKAGE.UPDATES.SECURITY.WARN}'
+              name: 'Linux: Security package updates are available'
+              priority: WARNING
+              description: 'One or more security-related package updates are available according to the configured threshold.'
+              tags:
+                - tag: scope
+                  value: security
+        - uuid: 9498d9a83d494536996e9df2d27740d9
+          name: 'Package updates: Security detection status'
+          type: DEPENDENT
+          key: linux.package.updates.security_detection
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.updates.security_detection
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+            - tag: component
+              value: security
+        - uuid: 5952c951505c4b4e88ecc93af6c2e539
+          name: 'Package updates: Package manager'
+          type: DEPENDENT
+          key: linux.package.updates.manager
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.package_manager
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+        - uuid: 3bc841ee4c30427f8faacb9a1794dc97
+          name: 'Package updates: Distribution'
+          type: DEPENDENT
+          key: linux.package.updates.distribution
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.distribution.name
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+        - uuid: 02b75ff11db74c8abda6616aee864844
+          name: 'Package updates: Distribution version'
+          type: DEPENDENT
+          key: linux.package.updates.distribution_version
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.distribution.version
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+        - uuid: 2aaa41ab8bf5490eb0d47f8d790cf22f
+          name: 'Package updates: Reboot required'
+          type: DEPENDENT
+          key: linux.package.updates.reboot_required
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.reboot_required
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+        - uuid: 87c8cae73dcd4476a28dbda156c39737
+          name: 'Package updates: Reboot detection status'
+          type: DEPENDENT
+          key: linux.package.updates.reboot_detection
+          value_type: CHAR
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.reboot_detection
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+        - uuid: ae18c5df5cdb472ba600a71ce41ada42
+          name: 'Package updates: Last repository refresh'
+          type: DEPENDENT
+          key: linux.package.updates.last_refresh
+          units: unixtime
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.last_refresh
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+        - uuid: 72a0bb5729b848d5903391d2f2ec20f1
+          name: 'Package updates: Last check'
+          type: DEPENDENT
+          key: linux.package.updates.last_check
+          units: unixtime
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.last_check
+          master_item:
+            key: linux.package.updates
+          tags:
+            - tag: component
+              value: package-updates
+      tags:
+        - tag: class
+          value: software
+        - tag: target
+          value: linux
+      macros:
+        - macro: '{$PACKAGE.UPDATES.WARN}'
+          value: '1'
+          description: 'Minimum number of available package updates that generates an informational problem.'
+        - macro: '{$PACKAGE.UPDATES.SECURITY.WARN}'
+          value: '1'
+          description: 'Minimum number of security package updates that generates a warning.'
 
