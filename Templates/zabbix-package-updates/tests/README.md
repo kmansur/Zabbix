@@ -3,15 +3,18 @@
 Execute:
 
 ```bash
-./tests/test_parsers.sh
+./tests/test_core.sh
 ```
 
-Os testes atuais validam parsers com comandos simulados para:
+Os testes atuais validam:
 
-- APT;
-- DNF5;
-- escape básico de JSON.
+- sintaxe Bash do coletor;
+- escape básico de JSON;
+- normalização de valores booleanos;
+- ausência de `eval`, `sh -c` e `bash -c`;
+- ausência de `system.run`;
+- ausência de comandos de instalação, remoção ou upgrade no coletor de monitoramento.
 
-Os testes não substituem validação em distribuições reais.
+Os testes automatizados não substituem a validação em distribuições reais.
 
-Antes de uma release estável, o projeto deverá incluir cenários adicionais para DNF, YUM, erros de repositório, timeouts, locks e retornos incompletos.
+Antes de uma release estável, o projeto deverá ampliar a cobertura com fixtures e ambientes reais para APT, DNF/DNF5, erros de repositório, timeouts, locks e diferentes formatos de saída dos gerenciadores de pacotes.
