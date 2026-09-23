@@ -1308,10 +1308,10 @@ Phase 4
 Multi-distribution support
 
 Phase 5
-Controlled manual remediation
+Controlled manual update application
 
 Phase 6
-Optional advanced remediation policies
+Optional advanced update policies
 ```
 
 Do not implement automatic remediation before monitoring is stable, tested, documented, and security-reviewed.
@@ -1365,10 +1365,29 @@ Linux package update monitoring
 Optional future scope:
 
 ```text
-tightly controlled package update remediation
+tightly controlled application of available package updates
 ```
 
-Features unrelated to that purpose should normally be rejected.
+The project must never expose a generic package installation/removal interface.
+
+Explicitly out of scope:
+
+```text
+install arbitrary package
+remove package
+purge package
+install package from a URL or local file
+accept arbitrary package names from Zabbix
+accept arbitrary package-manager options from Zabbix
+distribution release upgrades
+generic package-manager command execution
+```
+
+A normal operating-system update transaction may legitimately install a new dependency, replacement package, or kernel package when the native package manager determines that it is required to update already-managed software. This does not make arbitrary package installation a supported project feature.
+
+The collector/updater must never provide Zabbix with an interface equivalent to `apt install <package>`, `dnf install <package>`, `zypper install <package>`, package removal, or an arbitrary package-manager command line.
+
+Features unrelated to monitoring or controlled application of already-available updates should be rejected.
 
 ---
 
