@@ -73,6 +73,24 @@ load_config() {
         die REMEDIATION_NOT_SUPPORTED 'This release is monitoring-only; remediation must remain disabled.' 78
 }
 
+validate_collector_security() {
+    local path parent owner mode
+    [[ ! -L "$0" ]] || die INSECURE_COLLECTOR 'Collector must not be invoked through a symbolic link.' 77
+    path=$(readlink -f -- "$0") || die INSECURE_COLLECTOR 'Unable to resolve collector path.' 77
+    [[ -f "$path" ]] || die INSECURE_COLLECTOR 'Collector must be a regular file.' 77
+
+    owner=$(stat -c '%u' "$path") || die INSECURE_COLLECTOR 'Unable to verify collector ownership.' 77
+    mode=$(stat -c '%A' "$path") || die INSECURE_COLLECTOR 'Unable to verify collector permissions.' 77
+    [[ $owner == 0 && ${mode:5:1} != w && ${mode:8:1} != w ]] || \
+        die INSECURE_COLLECTOR 'Collector must be root-owned and not group/other writable.' 77
+
+    parent=${path%/*}
+    owner=$(stat -c '%u' "$parent") || die INSECURE_COLLECTOR 'Unable to verify collector directory ownership.' 77
+    mode=$(stat -c '%A' "$parent") || die INSECURE_COLLECTOR 'Unable to verify collector directory permissions.' 77
+    [[ $owner == 0 && ${mode:5:1} != w && ${mode:8:1} != w ]] || \
+        die INSECURE_COLLECTOR 'Collector directory must be root-owned and not group/other writable.' 77
+}
+
 secure_runtime() {
     [[ ! -L "$CACHE_DIR" && ! -L "$RUN_DIR" ]] || die INSECURE_DIRECTORY 'State directories must not be symlinks.' 73
     install -d -o root -g root -m 0750 "$CACHE_DIR" "$RUN_DIR" || die DIRECTORY_ERROR 'Unable to create secure state directories.' 73
@@ -197,6 +215,7 @@ collect_dnf() {
 main() {
     (( $# == 0 )) || die INVALID_ARGUMENTS 'This collector accepts no command-line arguments.' 64
     (( EUID == 0 )) || die ROOT_REQUIRED 'Collector must run as root through the restricted sudo rule.' 77
+    validate_collector_security
     load_config
     [[ $CHECK_ENABLED == yes ]] || { printf '{"schema_version":1,"status":"disabled","collector_version":"%s","timestamp":%s}\n' "$VERSION" "$(date +%s)"; exit 0; }
     secure_runtime
@@ -226,4 +245,6 @@ main() {
     emit_packages; printf '}\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
