@@ -1,248 +1,818 @@
 #!/usr/bin/env bash
-# zabbix-package-updates - monitoring-only Linux package update collector.
-# It never installs, removes or upgrades packages.
+#
+# zabbix-package-updates
+#
+# Security-focused Linux package update collector for Zabbix.
+#
+# Monitoring only.
+# This program does not install, remove, purge, or upgrade packages.
+#
 
 set -u
 set -o pipefail
+
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
-LC_ALL=C
-LANG=C
-export PATH LC_ALL LANG
+export PATH
+LC_ALL='C'
+LANG='C'
+export LC_ALL LANG
 umask 027
 
-readonly VERSION='0.1.0-dev'
-readonly CONFIG='/etc/zabbix-package-updates.conf'
-readonly CACHE_DIR='/var/cache/zabbix-package-updates'
-readonly RUN_DIR='/run/zabbix-package-updates'
-readonly STAMP="${CACHE_DIR}/last_refresh"
-readonly LOCK="${RUN_DIR}/collector.lock"
+readonly PROGRAM_NAME='zabbix-package-updates'
+readonly PROGRAM_VERSION='0.1.0-dev'
+readonly SCHEMA_VERSION=1
 
-CHECK_ENABLED=yes
-REFRESH_ENABLED=yes
+readonly CONFIG_FILE='/etc/zabbix-package-updates.conf'
+readonly CACHE_DIR='/var/cache/zabbix-package-updates'
+readonly RUNTIME_DIR='/run/zabbix-package-updates'
+readonly LAST_REFRESH_FILE="${CACHE_DIR}/last_refresh"
+readonly LOCK_FILE="${RUNTIME_DIR}/collector.lock"
+
+CHECK_ENABLED='yes'
+REFRESH_ENABLED='yes'
 REFRESH_INTERVAL=21600
 COMMAND_TIMEOUT=120
-APPLY_SECURITY_ENABLED=no
-APPLY_ALL_ENABLED=no
-AUTO_REBOOT=no
+APPLY_SECURITY_ENABLED='no'
+APPLY_ALL_ENABLED='no'
+AUTO_REBOOT='no'
+
+OS_ID='unknown'
+OS_NAME='Unknown Linux'
+OS_VERSION='unknown'
+OS_ID_LIKE=''
+PACKAGE_MANAGER='unknown'
+SECURITY_STATUS='unknown'
+REBOOT_STATUS='unknown'
+REBOOT_REQUIRED='null'
+LAST_REFRESH=0
+LAST_CHECK=0
+
+APT_GET=''
+APT=''
+DPKG_QUERY=''
+RPM=''
+DNF=''
+DNF5=''
+YUM=''
+TIMEOUT_BIN=''
+FLOCK_BIN=''
+STAT_BIN=''
+READLINK_BIN=''
+
+WORK_DIR=''
+PACKAGES_FILE=''
+SECURITY_KEYS_FILE=''
 
 json_escape() {
-    local s=${1-}
-    s=${s//\\/\\\\}; s=${s//\"/\\\"}
-    s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
-    printf '%s' "$s"
+    local value=${1-}
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "${value}"
 }
 
-error_json() {
-    local code=$1 msg=$2
-    printf '{"schema_version":1,"status":"error","collector_version":"%s","timestamp":%s,"error_code":"%s","message":"%s"}\n' \
-      "$VERSION" "$(date +%s 2>/dev/null || echo 0)" "$(json_escape "$code")" "$(json_escape "$msg")"
+emit_error() {
+    local code=${1-UNKNOWN_ERROR}
+    local message=${2-Unknown error}
+    local now
+    now=$(date +%s 2>/dev/null || printf '0')
+
+    printf '{"schema_version":%d,"status":"error","collector_version":"%s","timestamp":%s,"error_code":"%s","message":"%s"}\n' \
+        "${SCHEMA_VERSION}" \
+        "$(json_escape "${PROGRAM_VERSION}")" \
+        "${now}" \
+        "$(json_escape "${code}")" \
+        "$(json_escape "${message}")"
 }
 
-die() { error_json "$1" "$2"; exit "${3:-1}"; }
+emit_disabled() {
+    local now
+    now=$(date +%s 2>/dev/null || printf '0')
+    printf '{"schema_version":%d,"status":"disabled","collector_version":"%s","timestamp":%s,"message":"Package update monitoring is disabled locally."}\n' \
+        "${SCHEMA_VERSION}" "$(json_escape "${PROGRAM_VERSION}")" "${now}"
+}
 
-bool() {
-    case "${1,,}" in yes|true|1|on) printf yes;; no|false|0|off) printf no;; *) return 1;; esac
+trim() {
+    local value=${1-}
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "${value}"
+}
+
+strip_optional_quotes() {
+    local value=${1-}
+
+    if [[ ${#value} -ge 2 && ${value:0:1} == '"' && ${value: -1} == '"' ]]; then
+        value=${value:1:${#value}-2}
+        value=${value//\\\"/\"}
+        value=${value//\\\\/\\}
+    elif [[ ${#value} -ge 2 && ${value:0:1} == "'" && ${value: -1} == "'" ]]; then
+        value=${value:1:${#value}-2}
+    fi
+
+    printf '%s' "${value}"
+}
+
+parse_bool() {
+    local value
+    value=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')
+
+    case "${value}" in
+        yes|true|1|on) printf 'yes' ;;
+        no|false|0|off) printf 'no' ;;
+        *) return 1 ;;
+    esac
+}
+
+parse_positive_integer() {
+    local value=${1-}
+    [[ "${value}" =~ ^[0-9]+$ ]] || return 1
+    (( value > 0 )) || return 1
+    printf '%d' "${value}"
+}
+
+find_binary() {
+    local variable_name=$1
+    shift
+    local candidate path
+
+    for candidate in "$@"; do
+        path=$(command -v "${candidate}" 2>/dev/null) || continue
+        printf -v "${variable_name}" '%s' "${path}"
+        return 0
+    done
+
+    return 1
+}
+
+bootstrap_required_tools() {
+    find_binary TIMEOUT_BIN timeout || {
+        emit_error 'DEPENDENCY_NOT_FOUND' 'Required command timeout was not found.'
+        return 1
+    }
+    find_binary FLOCK_BIN flock || {
+        emit_error 'DEPENDENCY_NOT_FOUND' 'Required command flock was not found.'
+        return 1
+    }
+    find_binary STAT_BIN stat || {
+        emit_error 'DEPENDENCY_NOT_FOUND' 'Required command stat was not found.'
+        return 1
+    }
+    find_binary READLINK_BIN readlink || {
+        emit_error 'DEPENDENCY_NOT_FOUND' 'Required command readlink was not found.'
+        return 1
+    }
+}
+
+validate_secure_file() {
+    local file=$1
+    local description=$2
+    local owner mode
+
+    [[ ! -L "${file}" ]] || {
+        emit_error 'INSECURE_FILE' "${description} must not be a symbolic link."
+        return 1
+    }
+
+    [[ -f "${file}" ]] || {
+        emit_error 'INSECURE_FILE' "${description} is not a regular file."
+        return 1
+    }
+
+    owner=$("${STAT_BIN}" -c '%u' -- "${file}" 2>/dev/null) || {
+        emit_error 'INSECURE_FILE' "Unable to verify ${description} ownership."
+        return 1
+    }
+
+    mode=$("${STAT_BIN}" -c '%a' -- "${file}" 2>/dev/null) || {
+        emit_error 'INSECURE_FILE' "Unable to verify ${description} permissions."
+        return 1
+    }
+
+    [[ "${owner}" == '0' ]] || {
+        emit_error 'INSECURE_FILE' "${description} must be owned by root."
+        return 1
+    }
+
+    if (( (8#${mode} & 8#022) != 0 )); then
+        emit_error 'INSECURE_FILE' "${description} must not be writable by group or others."
+        return 1
+    fi
+}
+
+validate_secure_directory() {
+    local directory=$1
+    local description=$2
+    local owner mode
+
+    [[ ! -L "${directory}" ]] || {
+        emit_error 'INSECURE_DIRECTORY' "${description} must not be a symbolic link."
+        return 1
+    }
+
+    [[ -d "${directory}" ]] || {
+        emit_error 'INSECURE_DIRECTORY' "${description} is not a directory."
+        return 1
+    }
+
+    owner=$("${STAT_BIN}" -c '%u' -- "${directory}" 2>/dev/null) || {
+        emit_error 'INSECURE_DIRECTORY' "Unable to verify ${description} ownership."
+        return 1
+    }
+
+    mode=$("${STAT_BIN}" -c '%a' -- "${directory}" 2>/dev/null) || {
+        emit_error 'INSECURE_DIRECTORY' "Unable to verify ${description} permissions."
+        return 1
+    }
+
+    [[ "${owner}" == '0' ]] || {
+        emit_error 'INSECURE_DIRECTORY' "${description} must be owned by root."
+        return 1
+    }
+
+    if (( (8#${mode} & 8#022) != 0 )); then
+        emit_error 'INSECURE_DIRECTORY' "${description} must not be writable by group or others."
+        return 1
+    fi
+}
+
+validate_self_security() {
+    local script_path parent
+
+    script_path=$("${READLINK_BIN}" -f -- "$0" 2>/dev/null) || {
+        emit_error 'INSECURE_COLLECTOR' 'Unable to resolve collector path.'
+        return 1
+    }
+
+    validate_secure_file "${script_path}" 'Collector executable' || return 1
+
+    parent=${script_path%/*}
+    validate_secure_directory "${parent}" 'Collector directory' || return 1
 }
 
 load_config() {
-    [[ -e "$CONFIG" ]] || return 0
-    [[ -f "$CONFIG" && ! -L "$CONFIG" ]] || die INSECURE_CONFIG 'Configuration must be a regular file.' 78
-    [[ $(stat -c '%u' "$CONFIG") == 0 ]] || die INSECURE_CONFIG 'Configuration must be owned by root.' 78
-    local mode; mode=$(stat -c '%A' "$CONFIG")
-    [[ ${mode:5:1} != w && ${mode:8:1} != w ]] || die INSECURE_CONFIG 'Configuration must not be group/other writable.' 78
+    local line key value parsed line_number=0
 
-    local line key value parsed
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" || ${line:0:1} == '#' ]] && continue
-        [[ $line == *=* ]] || die CONFIG_INVALID 'Invalid configuration line.' 78
-        key=${line%%=*}; value=${line#*=}
-        case "$key" in
+    [[ -e "${CONFIG_FILE}" ]] || return 0
+    validate_secure_file "${CONFIG_FILE}" 'Configuration file' || return 1
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        ((line_number += 1))
+        line=$(trim "${line}")
+        [[ -z "${line}" || ${line:0:1} == '#' ]] && continue
+
+        [[ "${line}" == *'='* ]] || {
+            emit_error 'CONFIG_INVALID_LINE' "Invalid configuration at line ${line_number}."
+            return 1
+        }
+
+        key=$(trim "${line%%=*}")
+        value=$(trim "${line#*=}")
+        value=$(strip_optional_quotes "${value}")
+
+        case "${key}" in
             CHECK_ENABLED|REFRESH_ENABLED|APPLY_SECURITY_ENABLED|APPLY_ALL_ENABLED|AUTO_REBOOT)
-                parsed=$(bool "$value") || die CONFIG_INVALID "Invalid boolean for $key." 78
-                printf -v "$key" '%s' "$parsed"
+                parsed=$(parse_bool "${value}") || {
+                    emit_error 'CONFIG_INVALID_VALUE' "Invalid boolean value for ${key}."
+                    return 1
+                }
+                printf -v "${key}" '%s' "${parsed}"
                 ;;
             REFRESH_INTERVAL|COMMAND_TIMEOUT)
-                [[ $value =~ ^[0-9]+$ && $value -gt 0 ]] || die CONFIG_INVALID "Invalid integer for $key." 78
-                printf -v "$key" '%s' "$value"
+                parsed=$(parse_positive_integer "${value}") || {
+                    emit_error 'CONFIG_INVALID_VALUE' "${key} must be a positive integer."
+                    return 1
+                }
+                printf -v "${key}" '%s' "${parsed}"
                 ;;
-            *) die CONFIG_INVALID "Unknown configuration key: $key." 78;;
+            *)
+                emit_error 'CONFIG_UNKNOWN_KEY' "Unknown configuration key: ${key}."
+                return 1
+                ;;
         esac
-    done < "$CONFIG"
+    done < "${CONFIG_FILE}"
 
-    [[ $APPLY_SECURITY_ENABLED == no && $APPLY_ALL_ENABLED == no && $AUTO_REBOOT == no ]] || \
-        die REMEDIATION_NOT_SUPPORTED 'This release is monitoring-only; remediation must remain disabled.' 78
-}
-
-validate_collector_security() {
-    local path parent owner mode
-    [[ ! -L "$0" ]] || die INSECURE_COLLECTOR 'Collector must not be invoked through a symbolic link.' 77
-    path=$(readlink -f -- "$0") || die INSECURE_COLLECTOR 'Unable to resolve collector path.' 77
-    [[ -f "$path" ]] || die INSECURE_COLLECTOR 'Collector must be a regular file.' 77
-
-    owner=$(stat -c '%u' "$path") || die INSECURE_COLLECTOR 'Unable to verify collector ownership.' 77
-    mode=$(stat -c '%A' "$path") || die INSECURE_COLLECTOR 'Unable to verify collector permissions.' 77
-    [[ $owner == 0 && ${mode:5:1} != w && ${mode:8:1} != w ]] || \
-        die INSECURE_COLLECTOR 'Collector must be root-owned and not group/other writable.' 77
-
-    parent=${path%/*}
-    owner=$(stat -c '%u' "$parent") || die INSECURE_COLLECTOR 'Unable to verify collector directory ownership.' 77
-    mode=$(stat -c '%A' "$parent") || die INSECURE_COLLECTOR 'Unable to verify collector directory permissions.' 77
-    [[ $owner == 0 && ${mode:5:1} != w && ${mode:8:1} != w ]] || \
-        die INSECURE_COLLECTOR 'Collector directory must be root-owned and not group/other writable.' 77
-}
-
-secure_runtime() {
-    [[ ! -L "$CACHE_DIR" && ! -L "$RUN_DIR" ]] || die INSECURE_DIRECTORY 'State directories must not be symlinks.' 73
-    install -d -o root -g root -m 0750 "$CACHE_DIR" "$RUN_DIR" || die DIRECTORY_ERROR 'Unable to create secure state directories.' 73
-}
-
-refresh_due() {
-    local now stamp=0
-    now=$(date +%s)
-    if [[ -f "$STAMP" && ! -L "$STAMP" ]]; then
-        read -r stamp < "$STAMP" || stamp=0
-        [[ $stamp =~ ^[0-9]+$ ]] || stamp=0
+    if [[ "${APPLY_SECURITY_ENABLED}" == 'yes' || "${APPLY_ALL_ENABLED}" == 'yes' || "${AUTO_REBOOT}" == 'yes' ]]; then
+        emit_error 'REMEDIATION_NOT_SUPPORTED' 'This release is monitoring-only; update application and automatic reboot must remain disabled.'
+        return 1
     fi
-    (( stamp == 0 || now - stamp >= REFRESH_INTERVAL ))
 }
 
-mark_refresh() {
-    local tmp now
-    now=$(date +%s)
-    tmp=$(mktemp "${CACHE_DIR}/last_refresh.XXXXXX") || return 1
-    chmod 0640 "$tmp" && printf '%s\n' "$now" > "$tmp" && mv -f "$tmp" "$STAMP"
-}
-
-run_timeout() { timeout --signal=TERM --kill-after=10 "$COMMAND_TIMEOUT" "$@"; }
-
-read_os() {
-    OS_ID=unknown; OS_NAME='Unknown Linux'; OS_VERSION=unknown; OS_LIKE=''
-    [[ -r /etc/os-release ]] || die OS_RELEASE_UNAVAILABLE 'Unable to read /etc/os-release.' 69
-    local key value
-    while IFS='=' read -r key value; do
-        value=${value%\"}; value=${value#\"}; value=${value%\'}; value=${value#\'}
-        case "$key" in ID) OS_ID=$value;; NAME) OS_NAME=$value;; VERSION_ID) OS_VERSION=$value;; ID_LIKE) OS_LIKE=$value;; esac
-    done < /etc/os-release
-    if [[ -x /usr/bin/pveversion && $(/usr/bin/pveversion 2>/dev/null) == pve-manager/* ]]; then
-        OS_ID=proxmox; OS_NAME='Proxmox VE'
+prepare_directories() {
+    if [[ -L "${CACHE_DIR}" || -L "${RUNTIME_DIR}" ]]; then
+        emit_error 'INSECURE_DIRECTORY' 'Collector state directories must not be symbolic links.'
+        return 1
     fi
+
+    mkdir -p -- "${CACHE_DIR}" "${RUNTIME_DIR}" || {
+        emit_error 'DIRECTORY_CREATE_FAILED' 'Unable to create collector state directories.'
+        return 1
+    }
+
+    chown root:root "${CACHE_DIR}" "${RUNTIME_DIR}" || {
+        emit_error 'DIRECTORY_OWNERSHIP_FAILED' 'Unable to secure collector state directories.'
+        return 1
+    }
+
+    chmod 0750 "${CACHE_DIR}" "${RUNTIME_DIR}" || {
+        emit_error 'DIRECTORY_PERMISSION_FAILED' 'Unable to secure collector state directories.'
+        return 1
+    }
+
+    validate_secure_directory "${CACHE_DIR}" 'Cache directory' || return 1
+    validate_secure_directory "${RUNTIME_DIR}" 'Runtime directory' || return 1
+}
+
+prepare_work_files() {
+    WORK_DIR=$(mktemp -d "${RUNTIME_DIR}/work.XXXXXX") || {
+        emit_error 'TEMP_CREATE_FAILED' 'Unable to create a private working directory.'
+        return 1
+    }
+    chmod 0700 "${WORK_DIR}" || return 1
+
+    PACKAGES_FILE="${WORK_DIR}/packages.tsv"
+    SECURITY_KEYS_FILE="${WORK_DIR}/security-keys.txt"
+    : > "${PACKAGES_FILE}"
+    : > "${SECURITY_KEYS_FILE}"
+    chmod 0600 "${PACKAGES_FILE}" "${SECURITY_KEYS_FILE}"
+}
+
+cleanup() {
+    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
+        rm -rf -- "${WORK_DIR}"
+    fi
+}
+
+read_os_release() {
+    local file='/etc/os-release'
+    local line key value
+
+    [[ -r "${file}" ]] || {
+        emit_error 'OS_RELEASE_UNAVAILABLE' 'Unable to read /etc/os-release.'
+        return 1
+    }
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" || ${line:0:1} == '#' || "${line}" != *'='* ]] && continue
+        key=${line%%=*}
+        value=${line#*=}
+        value=$(strip_optional_quotes "${value}")
+
+        case "${key}" in
+            ID) OS_ID=${value} ;;
+            NAME) OS_NAME=${value} ;;
+            VERSION_ID) OS_VERSION=${value} ;;
+            ID_LIKE) OS_ID_LIKE=${value} ;;
+        esac
+    done < "${file}"
+
+    [[ -n "${OS_ID}" ]] || OS_ID='unknown'
+    [[ -n "${OS_NAME}" ]] || OS_NAME="${OS_ID}"
+    [[ -n "${OS_VERSION}" ]] || OS_VERSION='unknown'
+}
+
+detect_package_manager() {
+    local identity=" ${OS_ID} ${OS_ID_LIKE} "
+
+    if [[ "${identity}" == *' debian '* || "${OS_ID}" == 'ubuntu' || "${OS_ID}" == 'linuxmint' ]]; then
+        find_binary APT_GET apt-get || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'apt-get was not found.'
+            return 1
+        }
+        find_binary APT apt || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'apt was not found.'
+            return 1
+        }
+        find_binary DPKG_QUERY dpkg-query || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'dpkg-query was not found.'
+            return 1
+        }
+        PACKAGE_MANAGER='apt'
+        return 0
+    fi
+
+    if [[ "${identity}" == *' rhel '* || "${identity}" == *' fedora '* || "${identity}" == *' centos '* ||
+          "${OS_ID}" == 'rocky' || "${OS_ID}" == 'almalinux' || "${OS_ID}" == 'ol' ]]; then
+        find_binary RPM rpm || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'rpm was not found.'
+            return 1
+        }
+
+        if find_binary DNF5 dnf5; then
+            PACKAGE_MANAGER='dnf5'
+            return 0
+        fi
+        if find_binary DNF dnf; then
+            PACKAGE_MANAGER='dnf'
+            return 0
+        fi
+        if find_binary YUM yum; then
+            PACKAGE_MANAGER='yum'
+            return 0
+        fi
+
+        emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'No supported RPM package manager was found.'
+        return 1
+    fi
+
+    emit_error 'UNSUPPORTED_DISTRIBUTION' "Unsupported Linux distribution: ${OS_ID}."
+    return 1
+}
+
+detect_platform_variant() {
+    local pveversion version
+
+    if [[ "${PACKAGE_MANAGER}" == 'apt' && -x '/usr/bin/pveversion' ]]; then
+        pveversion=$(/usr/bin/pveversion 2>/dev/null | head -n 1 || true)
+        if [[ "${pveversion}" == pve-manager/* ]]; then
+            version=${pveversion#pve-manager/}
+            version=${version%%/*}
+            OS_ID='proxmox'
+            OS_NAME='Proxmox VE'
+            [[ -n "${version}" ]] && OS_VERSION=${version}
+        fi
+    fi
+}
+
+read_last_refresh() {
+    local value=0
+
+    if [[ -f "${LAST_REFRESH_FILE}" && ! -L "${LAST_REFRESH_FILE}" ]]; then
+        IFS= read -r value < "${LAST_REFRESH_FILE}" || value=0
+        [[ "${value}" =~ ^[0-9]+$ ]] || value=0
+    fi
+
+    LAST_REFRESH=${value}
+}
+
+write_last_refresh() {
+    local timestamp=$1
+    local temporary
+
+    temporary=$(mktemp "${CACHE_DIR}/last_refresh.XXXXXX") || return 1
+    chmod 0640 "${temporary}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+
+    printf '%s\n' "${timestamp}" > "${temporary}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+
+    mv -f -- "${temporary}" "${LAST_REFRESH_FILE}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+
+    LAST_REFRESH=${timestamp}
+}
+
+refresh_is_due() {
+    local now=$1
+
+    (( LAST_REFRESH <= 0 )) && return 0
+    (( now < LAST_REFRESH )) && return 0
+    (( now - LAST_REFRESH >= REFRESH_INTERVAL ))
+}
+
+run_timeout() {
+    "${TIMEOUT_BIN}" --foreground "${COMMAND_TIMEOUT}" "$@"
 }
 
 refresh_metadata() {
-    [[ $REFRESH_ENABLED == yes ]] || return 0
-    refresh_due || return 0
-    case "$PM" in
-        apt) DEBIAN_FRONTEND=noninteractive run_timeout apt-get -o Dpkg::Use-Pty=0 -o APT::Update::Error-Mode=any update >/dev/null 2>&1;;
-        dnf5) run_timeout dnf5 -q makecache --refresh >/dev/null 2>&1;;
-        dnf) run_timeout dnf -q makecache --refresh >/dev/null 2>&1;;
-        *) return 0;;
+    local now=$1
+    local rc=0
+
+    [[ "${REFRESH_ENABLED}" == 'yes' ]] || return 0
+    refresh_is_due "${now}" || return 0
+
+    case "${PACKAGE_MANAGER}" in
+        apt)
+            run_timeout "${APT_GET}" -q update >/dev/null 2>&1 || rc=$?
+            ;;
+        dnf5)
+            run_timeout "${DNF5}" -q makecache --refresh >/dev/null 2>&1 || rc=$?
+            ;;
+        dnf)
+            run_timeout "${DNF}" -q makecache --refresh >/dev/null 2>&1 || rc=$?
+            ;;
+        yum)
+            run_timeout "${YUM}" -q makecache >/dev/null 2>&1 || rc=$?
+            ;;
+        *)
+            emit_error 'PACKAGE_MANAGER_UNSUPPORTED' 'Unsupported package manager during metadata refresh.'
+            return 1
+            ;;
     esac
-    local rc=$?
-    (( rc == 0 )) || die REPOSITORY_REFRESH_FAILED 'Unable to refresh repository metadata.' 69
-    mark_refresh || die CACHE_WRITE_FAILED 'Repository metadata refreshed but timestamp could not be saved.' 73
+
+    if (( rc != 0 )); then
+        emit_error 'REPOSITORY_REFRESH_FAILED' "Repository metadata refresh failed with exit code ${rc}."
+        return 1
+    fi
+
+    write_last_refresh "${now}" || {
+        emit_error 'CACHE_WRITE_FAILED' 'Unable to record repository metadata refresh timestamp.'
+        return 1
+    }
 }
 
-emit_packages() {
-    local first=1 line name arch installed available repo security
-    printf '['
-    while IFS=$'\t' read -r name arch installed available repo security; do
-        [[ -n ${name:-} ]] || continue
-        (( first )) || printf ','; first=0
-        printf '{"name":"%s","architecture":"%s","installed":"%s","available":"%s","repository":"%s","security":%s}' \
-          "$(json_escape "$name")" "$(json_escape "$arch")" "$(json_escape "$installed")" \
-          "$(json_escape "$available")" "$(json_escape "$repo")" "$security"
-    done < "$PACKAGES"
-    printf ']'
+sanitize_field() {
+    local value=${1-}
+    value=${value//$'\t'/ }
+    value=${value//$'\n'/ }
+    value=${value//$'\r'/ }
+    printf '%s' "${value}"
 }
 
-collect_apt() {
-    PM=apt; SECURITY_STATUS=heuristic
-    command -v apt-get >/dev/null && command -v apt >/dev/null && command -v dpkg-query >/dev/null || \
-        die PACKAGE_MANAGER_NOT_FOUND 'APT tools are unavailable.' 69
-    refresh_metadata
-    local out line package_repo rest available arch name repo installed security rc
-    out=$(mktemp "${RUN_DIR}/apt.XXXXXX") || die TEMP_ERROR 'Unable to create temporary file.' 73
-    run_timeout apt list --upgradable >"$out" 2>/dev/null; rc=$?
-    (( rc == 0 )) || { rm -f "$out"; die PACKAGE_CHECK_FAILED 'APT failed to list available updates.' 69; }
+append_package() {
+    local name=$1
+    local arch=$2
+    local installed=$3
+    local available=$4
+    local repository=$5
+    local security=$6
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(sanitize_field "${name}")" \
+        "$(sanitize_field "${arch}")" \
+        "$(sanitize_field "${installed}")" \
+        "$(sanitize_field "${available}")" \
+        "$(sanitize_field "${repository}")" \
+        "${security}" >> "${PACKAGES_FILE}"
+}
+
+collect_apt_updates() {
+    local output line package repository available arch installed security rest
+
+    output=$(run_timeout "${APT}" list --upgradable 2>/dev/null) || {
+        emit_error 'PACKAGE_QUERY_FAILED' 'Unable to query APT upgrades.'
+        return 1
+    }
+
+    SECURITY_STATUS='heuristic'
+
     while IFS= read -r line; do
-        [[ -n "$line" && "$line" != 'Listing...' && "$line" == */* ]] || continue
-        package_repo=${line%% *}; rest=${line#* }; available=${rest%% *}; rest=${rest#* }; arch=${rest%% *}
-        name=${package_repo%%/*}; repo=${package_repo#*/}
-        installed=''; [[ $line == *'[upgradable from: '* ]] && { installed=${line#*'[upgradable from: '}; installed=${installed%']'}; }
-        [[ -n "$installed" ]] || installed=$(dpkg-query -W -f='${Version}' "$name" 2>/dev/null || true)
-        security=false; [[ ${repo,,} == *security* ]] && security=true
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$arch" "$installed" "$available" "$repo" "$security" >> "$PACKAGES"
-    done < "$out"
-    rm -f "$out"
-}
+        [[ -z "${line}" || "${line}" == 'Listing...' || "${line}" != *'/'* ]] && continue
 
-collect_dnf5() {
-    PM=dnf5; SECURITY_STATUS=supported
-    command -v dnf5 >/dev/null && command -v rpm >/dev/null || die PACKAGE_MANAGER_NOT_FOUND 'DNF5/RPM tools are unavailable.' 69
-    refresh_metadata
-    local all sec name arch available repo installed key security
-    all=$(mktemp "${RUN_DIR}/dnf5-all.XXXXXX"); sec=$(mktemp "${RUN_DIR}/dnf5-sec.XXXXXX") || die TEMP_ERROR 'Unable to create temporary file.' 73
-    run_timeout dnf5 --cacheonly repoquery --upgrades --latest-limit=1 --queryformat $'%{name}\t%{arch}\t%{evr}\t%{repoid}\n' > "$all" 2>/dev/null || { rm -f "$all" "$sec"; die PACKAGE_CHECK_FAILED 'DNF5 failed to list available updates.' 69; }
-    run_timeout dnf5 --cacheonly repoquery --upgrades --latest-limit=1 --security --queryformat $'%{name}\t%{arch}\t%{evr}\n' > "$sec" 2>/dev/null || SECURITY_STATUS=unknown
-    while IFS=$'\t' read -r name arch available repo; do
-        [[ -n "$name" ]] || continue
-        installed=$(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' "$name.$arch" 2>/dev/null | head -n1 | sed 's/^0://' || true)
-        security=null
-        if [[ $SECURITY_STATUS == supported ]]; then
-            key=$'\t'; if grep -Fqx "$name${key}$arch${key}$available" "$sec"; then security=true; else security=false; fi
+        package=${line%%/*}
+        rest=${line#*/}
+        repository=${rest%% *}
+        rest=${rest#* }
+        available=${rest%% *}
+        rest=${rest#* }
+        arch=${rest%% *}
+        installed=''
+
+        if [[ "${line}" =~ \[upgradable[[:space:]]from:[[:space:]]([^]]+)\] ]]; then
+            installed=${BASH_REMATCH[1]}
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$arch" "$installed" "$available" "$repo" "$security" >> "$PACKAGES"
-    done < "$all"
-    rm -f "$all" "$sec"
+
+        if [[ -z "${installed}" ]]; then
+            installed=$(run_timeout "${DPKG_QUERY}" -W -f='${Version}' -- "${package}" 2>/dev/null || true)
+        fi
+
+        security='false'
+        case "${repository}" in
+            *security*|*Security*|*esm-*|*ESM*) security='true' ;;
+        esac
+
+        append_package "${package}" "${arch}" "${installed}" "${available}" "${repository}" "${security}"
+    done <<< "${output}"
 }
 
-collect_dnf() {
-    PM=dnf; SECURITY_STATUS=unknown
-    command -v dnf >/dev/null && command -v rpm >/dev/null || die PACKAGE_MANAGER_NOT_FOUND 'DNF/RPM tools are unavailable.' 69
-    refresh_metadata
-    local out line pkgarch available repo name arch installed
-    out=$(mktemp "${RUN_DIR}/dnf.XXXXXX") || die TEMP_ERROR 'Unable to create temporary file.' 73
-    run_timeout dnf -q --cacheonly list --upgrades > "$out" 2>/dev/null || { rm -f "$out"; die PACKAGE_CHECK_FAILED 'DNF failed to list available updates.' 69; }
-    while read -r pkgarch available repo _; do
-        [[ $pkgarch == *.* && $pkgarch != 'Available' ]] || continue
-        name=${pkgarch%.*}; arch=${pkgarch##*.}
-        installed=$(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' "$name.$arch" 2>/dev/null | head -n1 | sed 's/^0://' || true)
-        printf '%s\t%s\t%s\t%s\t%s\tnull\n' "$name" "$arch" "$installed" "$available" "${repo:-unknown}" >> "$PACKAGES"
-    done < "$out"
-    rm -f "$out"
+rpm_installed_version() {
+    local name=$1
+    local arch=$2
+    run_timeout "${RPM}" -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}' -- "${name}.${arch}" 2>/dev/null | sed 's/^0://'
+}
+
+collect_rpm_repoquery() {
+    local binary=$1
+    local security_only=$2
+    local output rc=0
+    local -a args
+
+    args=(-q repoquery --upgrades)
+    if [[ "${PACKAGE_MANAGER}" == 'dnf5' ]]; then
+        args+=(--queryformat '%{name}\t%{arch}\t%{evr}\t%{repoid}\n')
+    else
+        args+=(--qf '%{name}\t%{arch}\t%{evr}\t%{repoid}')
+    fi
+    [[ "${security_only}" == 'yes' ]] && args+=(--security)
+
+    output=$(run_timeout "${binary}" "${args[@]}" 2>/dev/null) || rc=$?
+
+    if (( rc != 0 )); then
+        return "${rc}"
+    fi
+
+    printf '%s' "${output}"
+}
+
+build_security_key_set() {
+    local binary=$1
+    local output line name arch version repository
+
+    : > "${SECURITY_KEYS_FILE}"
+
+    if ! output=$(collect_rpm_repoquery "${binary}" yes); then
+        SECURITY_STATUS='unknown'
+        return 0
+    fi
+
+    SECURITY_STATUS='supported'
+
+    while IFS=$'\t' read -r name arch version repository; do
+        [[ -n "${name}" && -n "${arch}" ]] || continue
+        printf '%s.%s\n' "${name}" "${arch}" >> "${SECURITY_KEYS_FILE}"
+    done <<< "${output}"
+
+    sort -u -o "${SECURITY_KEYS_FILE}" "${SECURITY_KEYS_FILE}"
+}
+
+security_key_exists() {
+    local key=$1
+    grep -Fxq -- "${key}" "${SECURITY_KEYS_FILE}"
+}
+
+collect_rpm_updates() {
+    local binary=$1
+    local output name arch available repository installed security key
+
+    build_security_key_set "${binary}"
+
+    output=$(collect_rpm_repoquery "${binary}" no) || {
+        emit_error 'PACKAGE_QUERY_FAILED' "Unable to query ${PACKAGE_MANAGER} upgrades."
+        return 1
+    }
+
+    while IFS=$'\t' read -r name arch available repository; do
+        [[ -n "${name}" && -n "${arch}" && -n "${available}" ]] || continue
+
+        installed=$(rpm_installed_version "${name}" "${arch}" || true)
+        key="${name}.${arch}"
+        security='false'
+        [[ "${SECURITY_STATUS}" == 'supported' ]] && security_key_exists "${key}" && security='true'
+
+        append_package "${name}" "${arch}" "${installed}" "${available}" "${repository}" "${security}"
+    done <<< "${output}"
+}
+
+collect_dnf5_updates() {
+    collect_rpm_updates "${DNF5}"
+}
+
+collect_dnf_updates() {
+    collect_rpm_updates "${DNF}"
+}
+
+collect_yum_updates() {
+    # yum-compatible systems vary significantly. Use repoquery through yum
+    # only when supported; fail explicitly rather than parsing unstable
+    # human-oriented output.
+    collect_rpm_updates "${YUM}"
+}
+
+detect_reboot_required() {
+    case "${PACKAGE_MANAGER}" in
+        apt)
+            REBOOT_STATUS='supported'
+            if [[ -f /var/run/reboot-required ]]; then
+                REBOOT_REQUIRED='true'
+            else
+                REBOOT_REQUIRED='false'
+            fi
+            ;;
+        dnf|dnf5|yum)
+            if command -v needs-restarting >/dev/null 2>&1; then
+                REBOOT_STATUS='supported'
+                if run_timeout needs-restarting -r >/dev/null 2>&1; then
+                    REBOOT_REQUIRED='false'
+                else
+                    case $? in
+                        1) REBOOT_REQUIRED='true' ;;
+                        *)
+                            REBOOT_STATUS='unknown'
+                            REBOOT_REQUIRED='null'
+                            ;;
+                    esac
+                fi
+            else
+                REBOOT_STATUS='unsupported'
+                REBOOT_REQUIRED='null'
+            fi
+            ;;
+        *)
+            REBOOT_STATUS='unsupported'
+            REBOOT_REQUIRED='null'
+            ;;
+    esac
+}
+
+emit_success() {
+    local total security_count
+    local first='yes'
+    local name arch installed available repository security
+
+    total=$(wc -l < "${PACKAGES_FILE}" | tr -d ' ')
+    security_count=$(awk -F '\t' '$6 == "true" {count++} END {print count+0}' "${PACKAGES_FILE}")
+
+    printf '{'
+    printf '"schema_version":%d,' "${SCHEMA_VERSION}"
+    printf '"status":"ok",'
+    printf '"collector_version":"%s",' "$(json_escape "${PROGRAM_VERSION}")"
+    printf '"timestamp":%s,' "${LAST_CHECK}"
+    printf '"distribution":{'
+    printf '"id":"%s",' "$(json_escape "${OS_ID}")"
+    printf '"name":"%s",' "$(json_escape "${OS_NAME}")"
+    printf '"version":"%s"' "$(json_escape "${OS_VERSION}")"
+    printf '},'
+    printf '"package_manager":"%s",' "$(json_escape "${PACKAGE_MANAGER}")"
+    printf '"updates":{"total":%s,"security":%s,"security_detection":"%s"},' \
+        "${total}" "${security_count}" "$(json_escape "${SECURITY_STATUS}")"
+    printf '"reboot_required":%s,' "${REBOOT_REQUIRED}"
+    printf '"reboot_detection":"%s",' "$(json_escape "${REBOOT_STATUS}")"
+    printf '"last_refresh":%s,' "${LAST_REFRESH}"
+    printf '"last_check":%s,' "${LAST_CHECK}"
+    printf '"packages":['
+
+    while IFS=$'\t' read -r name arch installed available repository security; do
+        [[ -n "${name}" ]] || continue
+        [[ "${first}" == 'yes' ]] || printf ','
+        first='no'
+        printf '{"name":"%s","arch":"%s","installed":"%s","available":"%s","repository":"%s","security":%s}' \
+            "$(json_escape "${name}")" \
+            "$(json_escape "${arch}")" \
+            "$(json_escape "${installed}")" \
+            "$(json_escape "${available}")" \
+            "$(json_escape "${repository}")" \
+            "${security}"
+    done < "${PACKAGES_FILE}"
+
+    printf ']}\n'
+}
+
+acquire_lock() {
+    exec 9>"${LOCK_FILE}" || {
+        emit_error 'LOCK_OPEN_FAILED' 'Unable to open collector lock file.'
+        return 1
+    }
+
+    "${FLOCK_BIN}" -n 9 || {
+        emit_error 'COLLECTOR_BUSY' 'Another collector instance is already running.'
+        return 1
+    }
 }
 
 main() {
-    (( $# == 0 )) || die INVALID_ARGUMENTS 'This collector accepts no command-line arguments.' 64
-    (( EUID == 0 )) || die ROOT_REQUIRED 'Collector must run as root through the restricted sudo rule.' 77
-    validate_collector_security
-    load_config
-    [[ $CHECK_ENABLED == yes ]] || { printf '{"schema_version":1,"status":"disabled","collector_version":"%s","timestamp":%s}\n' "$VERSION" "$(date +%s)"; exit 0; }
-    secure_runtime
-    exec 9>"$LOCK" || die LOCK_ERROR 'Unable to open collector lock.' 73
-    flock -n 9 || die COLLECTOR_BUSY 'Another collector process is already running.' 75
-    PACKAGES=$(mktemp "${RUN_DIR}/packages.XXXXXX") || die TEMP_ERROR 'Unable to create package list.' 73
-    chmod 0600 "$PACKAGES"; trap 'rm -f -- "$PACKAGES"' EXIT HUP INT TERM
-    read_os
-    local identity=" $OS_ID $OS_LIKE "
-    if [[ $identity == *' debian '* || $OS_ID == ubuntu || $OS_ID == linuxmint || $OS_ID == proxmox ]]; then collect_apt
-    elif command -v dnf5 >/dev/null 2>&1 && [[ $identity == *' rhel '* || $identity == *' fedora '* || $identity == *' centos '* || $OS_ID == rocky || $OS_ID == almalinux || $OS_ID == ol ]]; then collect_dnf5
-    elif command -v dnf >/dev/null 2>&1 && [[ $identity == *' rhel '* || $identity == *' fedora '* || $identity == *' centos '* || $OS_ID == rocky || $OS_ID == almalinux || $OS_ID == ol ]]; then collect_dnf
-    else die UNSUPPORTED_DISTRIBUTION "Unsupported Linux distribution: $OS_ID." 69; fi
-    local total security_count=0 last_refresh=0 reboot=null reboot_status=unknown now
-    total=$(wc -l < "$PACKAGES" | tr -d ' ')
-    [[ $SECURITY_STATUS == supported || $SECURITY_STATUS == heuristic ]] && security_count=$(awk -F '\t' '$6=="true"{n++}END{print n+0}' "$PACKAGES")
-    [[ -f /var/run/reboot-required ]] && { reboot=true; reboot_status=known; }
-    [[ -f "$STAMP" ]] && { read -r last_refresh < "$STAMP" || last_refresh=0; [[ $last_refresh =~ ^[0-9]+$ ]] || last_refresh=0; }
-    now=$(date +%s)
-    printf '{"schema_version":1,"status":"ok","collector_version":"%s","timestamp":%s,' "$VERSION" "$now"
-    printf '"distribution":{"id":"%s","name":"%s","version":"%s"},' "$(json_escape "$OS_ID")" "$(json_escape "$OS_NAME")" "$(json_escape "$OS_VERSION")"
-    printf '"package_manager":"%s","refresh_enabled":%s,"refresh_interval":%s,' "$PM" "$([[ $REFRESH_ENABLED == yes ]] && echo true || echo false)" "$REFRESH_INTERVAL"
-    printf '"updates":{"total":%s,"security":' "$total"
-    if [[ $SECURITY_STATUS == supported || $SECURITY_STATUS == heuristic ]]; then printf '%s' "$security_count"; else printf 'null'; fi
-    printf ',"security_status":"%s"},' "$SECURITY_STATUS"
-    printf '"reboot_required":%s,"reboot_status":"%s","last_refresh":%s,"last_check":%s,"packages":' "$reboot" "$reboot_status" "$last_refresh" "$now"
-    emit_packages; printf '}\n'
+    (( $# == 0 )) || {
+        emit_error 'ARGUMENTS_NOT_ALLOWED' 'This monitoring collector does not accept command-line arguments.'
+        return 64
+    }
+
+    (( EUID == 0 )) || {
+        emit_error 'ROOT_REQUIRED' 'The collector must be executed as root through the restricted sudo rule.'
+        return 77
+    }
+
+    bootstrap_required_tools || return 1
+    validate_self_security || return 1
+    load_config || return 1
+
+    if [[ "${CHECK_ENABLED}" != 'yes' ]]; then
+        emit_disabled
+        return 0
+    fi
+
+    prepare_directories || return 1
+    acquire_lock || return 1
+    prepare_work_files || return 1
+    trap cleanup EXIT HUP INT TERM
+
+    read_os_release || return 1
+    detect_package_manager || return 1
+    detect_platform_variant
+
+    read_last_refresh
+    LAST_CHECK=$(date +%s)
+    refresh_metadata "${LAST_CHECK}" || return 1
+
+    case "${PACKAGE_MANAGER}" in
+        apt) collect_apt_updates || return 1 ;;
+        dnf5) collect_dnf5_updates || return 1 ;;
+        dnf) collect_dnf_updates || return 1 ;;
+        yum) collect_yum_updates || return 1 ;;
+        *)
+            emit_error 'PACKAGE_MANAGER_UNSUPPORTED' "Unsupported package manager: ${PACKAGE_MANAGER}."
+            return 1
+            ;;
+    esac
+
+    detect_reboot_required
+    emit_success
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
