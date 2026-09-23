@@ -268,10 +268,12 @@ If `sudo` is required, the sudoers rule must allow only the required collector i
 Example baseline:
 
 ```sudoers
-zabbix ALL=(root) NOPASSWD: /usr/local/scripts/zabbix-package-updates
+zabbix ALL=(root) NOPASSWD: /usr/local/scripts/zabbix-package-updates ""
 ```
 
 Do not grant direct sudo access to package managers.
+
+The empty sudoers argument string (`""`) is required for the current collector because it means that no command-line arguments are allowed. A sudoers command entry without an argument restriction must not be used as a substitute, because it may permit arbitrary arguments to the allowed executable.
 
 Before installing or changing sudoers configuration, validate it with:
 
