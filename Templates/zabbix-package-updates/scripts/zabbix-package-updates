@@ -980,4 +980,72 @@ main() {
         emit_error 'DEPENDENCY_MISSING' 'Required command not found: timeout.'
         return 69
     }
- 
+    find_binary FLOCK_BIN flock || {
+        emit_error 'DEPENDENCY_MISSING' 'Required command not found: flock.'
+        return 69
+    }
+
+    if ! prepare_directories; then
+        return 73
+    fi
+
+    exec 9>"${LOCK_FILE}" || {
+        emit_error 'LOCK_OPEN_FAILED' 'Unable to open the collector lock file.'
+        return 73
+    }
+
+    if ! "${FLOCK_BIN}" -n 9; then
+        emit_error 'COLLECTOR_BUSY' 'Another package update collector process is already running.'
+        return 75
+    fi
+
+    if ! prepare_work_files; then
+        return 73
+    fi
+    trap cleanup EXIT HUP INT TERM
+
+    if ! read_os_release; then
+        return 69
+    fi
+
+    if ! detect_package_manager; then
+        return 69
+    fi
+
+    detect_platform_variant
+
+    read_last_refresh
+    now=$(date +%s)
+
+    if [[ "${REFRESH_ENABLED}" == 'yes' ]] && refresh_is_due "${now}"; then
+        if ! refresh_metadata; then
+            return 69
+        fi
+    fi
+
+    case "${PACKAGGE_MANAGER}" in
+        apt)
+            collect_apt_updates || return $?
+            ;;
+        dnf5)
+            collect_dnf5_updates || return $?
+            ;;
+        dnf)
+            collect_dnf_updates || return $?
+            ;;
+        yum)
+            collect_yum_updates || return $?
+            ;;
+        *)
+            emit_error 'INTERNAL_ERROR' 'No collector implementation for the selected package manager.'
+            return 70
+            ;;
+    esac
+
+    detect_reboot_status
+    emit_success
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
