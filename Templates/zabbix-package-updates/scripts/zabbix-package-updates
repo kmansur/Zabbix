@@ -525,4 +525,219 @@ refresh_metadata() {
             ;;
         yum)
             run_with_timeout "${YUM}" -q makecache fast >"${output_file}" 2>&1
-            
+            rc=$?
+            ;;
+        *)
+            emit_error 'INTERNAL_ERROR' 'Unsupported package manager reached metadata refresh.'
+            return 1
+            ;;
+    esac
+
+    if (( rc == 124 || rc == 137 )); then
+        emit_error 'REPOSITORY_REFRESH_TIMEOUT' 'Repository metadata refresh exceeded the configured timeout.'
+        return 1
+    fi
+
+    if (( rc != 0 )); then
+        emit_error 'REPOSITORY_REFRESH_FAILED' 'Unable to refresh package repository metadata.'
+        return 1
+    fi
+
+    now=$(date +%s)
+    if ! write_last_refresh "${now}"; then
+        emit_error 'CACHE_WRITE_FAILED' 'Repository metadata was refreshed but the refresh timestamp could not be saved.'
+        return 1
+    fi
+}
+
+append_package() {
+    local name=$1
+    local arch=$2
+    local installed=$3
+    local available=$4
+    local repository=$5
+    local security=$6
+
+    [[ -n "${name}" && -n "${available}" ]] || return 0
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${name}" "${arch}" "${installed}" "${available}" "${repository}" "${security}" \
+        >> "${PACKAGES_FILE}"
+}
+
+collect_apt_updates() {
+    local line package_repo name repository available rest architecture installed
+    local security='false'
+    local output_file="${WORK_DIR}/apt-upgradable.txt"
+
+    run_with_timeout "${APT}" list --upgradable >"${output_file}" 2>/dev/null
+    local rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        emit_error 'PACKAGE_CHECK_TIMEOUT' 'APT package check exceeded the configured timeout.'
+        return 1
+    fi
+    if (( rc != 0 )); then
+        emit_error 'PACKAGE_CHECK_FAILED' 'APT was unable to determine available package updates.'
+        return 1
+    fi
+
+    SECURITY_STATUS='heuristic'
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" || "${line}" == 'Listing...' ]] && continue
+        [[ "${line}" == *'/'* && "${line}" == *' '* ]] || continue
+
+        package_repo=${line%% *}
+        rest=${line#* }
+        available=${rest%% *}
+        rest=${rest#* }
+        architecture=${rest%% *}
+
+        name=${package_repo%%/*}
+        repository=${package_repo#*/}
+
+        installed=''
+        if [[ "${line}" == *'[upgradable from: '*']' ]]; then
+            installed=${line##*'[upgradable from: '}
+            installed=${installed%']'}
+        fi
+
+        if [[ -z "${installed}" ]]; then
+            installed=$("${DPKG_QUERY}" -W -f='${Version}' "${name}" 2>/dev/null || true)
+        fi
+
+        security='false'
+        if [[ "${repository,,}" == *security* ]]; then
+            security='true'
+        fi
+
+        append_package "${name}" "${architecture}" "${installed}" "${available}" "${repository}" "${security}"
+    done < "${output_file}"
+}
+
+rpm_installed_version() {
+    local name=$1
+    local arch=$2
+    "${RPM}" -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' "${name}.${arch}" 2>/dev/null | head -n 1 | sed 's/^0://'
+}
+
+collect_dnf5_updates() {
+    local output_file="${WORK_DIR}/dnf5-upgrades.tsv"
+    local security_file="${WORK_DIR}/dnf5-security.tsv"
+    local rc name arch available repository installed key security
+
+    run_with_timeout "${DNF5}" --cacheonly repoquery --upgrades --latest-limit=1 \
+        --queryformat '%{name}\t%{arch}\t%{evr}\t%{repoid}\n' \
+        >"${output_file}" 2>/dev/null
+    rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        emit_error 'PACKAGE_CHECK_TIMEOUT' 'DNF5 package check exceeded the configured timeout.'
+        return 1
+    fi
+    if (( rc != 0 )); then
+        emit_error 'PACKAGE_CHECK_FAILED' 'DNF5 was unable to determine available package updates from cached metadata.'
+        return 1
+    fi
+
+    if run_with_timeout "${DNF5}" --cacheonly repoquery --upgrades --latest-limit=1 --security \
+        --queryformat '%{name}\t%{arch}\t%{evr}\t%{repoid}\n' \
+        >"${security_file}" 2>/dev/null; then
+        SECURITY_STATUS='supported'
+        while IFS=$'\t' read -r name arch available repository || [[ -n "${name:-}" ]]; do
+            [[ -n "${name:-}" && -n "${arch:-}" && -n "${available:-}" ]] || continue
+            printf '%s|%s|%s\n' "${name}" "${arch}" "${available}" >> "${SECURITY_KEYS_FILE}"
+        done < "${security_file}"
+    else
+        SECURITY_STATUS='unknown'
+    fi
+
+    while IFS=$'\t' read -r name arch available repository || [[ -n "${name:-}" ]]; do
+        [[ -n "${name:-}" && -n "${arch:-}" && -n "${available:-}" ]] || continue
+
+        installed=$(rpm_installed_version "${name}" "${arch}")
+        key="${name}|${arch}|${available}"
+        security='null'
+
+        if [[ "${SECURITY_STATUS}" == 'supported' ]]; then
+            if grep -Fqx -- "${key}" "${SECURITY_KEYS_FILE}"; then
+                security='true'
+            else
+                security='false'
+            fi
+        fi
+
+        append_package "${name}" "${arch}" "${installed}" "${available}" "${repository:-unknown}" "${security}"
+    done < "${output_file}"
+}
+
+dnf4_repoquery_supported() {
+    "${DNF}" -q repoquery --help >/dev/null 2>&1
+}
+
+collect_dnf4_repoquery_updates() {
+    local output_file="${WORK_DIR}/dnf-upgrades.tsv"
+    local security_file="${WORK_DIR}/dnf-security.tsv"
+    local rc name arch available repository installed key security
+
+    run_with_timeout "${DNF}" -q --cacheonly repoquery --upgrades --latest-limit=1 \
+        --qf '%{name}\t%{arch}\t%{evr}\t%{repoid}\n' \
+        >"${output_file}" 2>/dev/null
+    rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        emit_error 'PACKAGE_CHECK_TIMEOUT' 'DNF package check exceeded the configured timeout.'
+        return 1
+    fi
+    if (( rc != 0 )); then
+        return 2
+    fi
+
+    if run_with_timeout "${DNF}" -q --cacheonly repoquery --upgrades --latest-limit=1 --security \
+        --qf '%{name}\t%{arch}\t%{evr}\t%{repoid}\n' \
+        >"${security_file}" 2>/dev/null; then
+        SECURITY_STATUS='supported'
+        while IFS=$'\t' read -r name arch available repository || [[ -n "${name:-}" ]]; do
+            [[ -n "${name:-}" && -n "${arch:-}" && -n "${available:-}" ]] || continue
+            printf '%s|%s|%s\n' "${name}" "${arch}" "${available}" >> "${SECURITY_KEYS_FILE}"
+        done < "${security_file}"
+    else
+        SECURITY_STATUS='unknown'
+    fi
+
+    while IFS=$'\t' read -r name arch available repository || [[ -n "${name:-}" ]]; do
+        [[ -n "${name:-}" && -n "${arch:-}" && -n "${available:-}" ]] || continue
+
+        installed=$(rpm_installed_version "${name}" "${arch}")
+        key="${name}|${arch}|${available}"
+        security='null'
+
+        if [[ "${SECURITY_STATUS}" == 'supported' ]]; then
+            if grep -Fqx -- "${key}" "${SECURITY_KEYS_FILE}"; then
+                security='true'
+            else
+                security='false'
+            fi
+        fi
+
+        append_package "${name}" "${arch}" "${installed}" "${available}" "${repository:-unknown}" "${security}"
+    done < "${output_file}"
+
+    return 0
+}
+
+collect_dnf4_list_updates() {
+    local output_file="${WORK_DIR}/dnf-list-upgrades.txt"
+    local security_file="${WORK_DIR}/dnf-list-security.txt"
+    local rc line pkgarch available repository name arch installed key security
+
+    run_with_timeout "${DNF}" -q --cacheonly list --upgrades >"${output_file}" 2>/dev/null
+    rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        emit_error 'PACKAGE_CHECK_TIMEOUT' 'DNF package check exceeded the configured timeout.'
+        return 1
+    fi
+    if (( rc != 0 )); then
+        emit_error 'PACKAGE_CHECK_FAILED' 'DNF was unable to determin
