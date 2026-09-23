@@ -740,4 +740,244 @@ collect_dnf4_list_updates() {
         return 1
     fi
     if (( rc != 0 )); then
-        emit_error 'PACKAGE_CHECK_FAILED' 'DNF was unable to determin
+        emit_error 'PACKAGE_CHECK_FAILED' 'DNF was unable to determin from cached metadata.'
+        return 1
+    fi
+
+    if run_with_timeout "${DNF}" -q --cacheonly list --upgrades --security >"${security_file}" 2>/dev/null; then
+        SECURITY_STATUS='supported'
+        while read -r pkgarch available repository _; do
+            [[ "${pkgarch:-}" == *.* && -n "${available:-}" ]] || continue
+            name=${pkgarch%.*}
+            arch=${pkgarch##*.}
+            printf '%s|%s|%s\n' "${name}" "${arch}" "${available}" >> "${SECURITY_KEYS_FILE}"
+        done < "${security_file}"
+    else
+        SECURITY_STATUS='unknown'
+    fi
+
+    while read -r pkgarch available repository _; do
+        [[ "${pkgarch:-}" == *.* && -n "${available:-}" ]] || continue
+        [[ "${pkgarch}" != 'Available.'* && "${pkgarch}" != 'Last'* ]] || continue
+
+        name=${pkgarch%.*}
+        arch=${pkgarch##*.}
+        installed=$(rpm_installed_version "${name}" "${arch}")
+        key="${name}|${arch}|${available}"
+        security='null'
+
+        if [[ "${SECURITY_STATUS}" == 'supported' ]]; then
+            if grep -Fqx -- "${key}" "${SECURITY_KEYS_FILE}"; then
+                security='true'
+            else
+                security='false'
+            fi
+        fi
+
+        append_package "${name}" "${arch}" "${installed}" "${available}" "${repository:-unknown}" "${security}"
+    done < "${output_file}"
+}
+
+collect_dnf_updates() {
+    if dnf4_repoquery_supported; then
+        collect_dnf4_repoquery_updates
+        local rc=$?
+        (( rc == 0 )) && return 0
+        (( rc == 1 )) && return 1
+    fi
+
+    : > "${PACKAGES_FILE}"
+    : > "${SECURITY_KEYS_FILE}"
+    collect_dnf4_list_updates
+}
+
+collect_yum_updates() {
+    local output_file="${WORK_DIR}/yum-list-upgrades.txt"
+    local rc pkgarch available repository name arch installed
+
+    run_with_timeout "${YUM}" -q --cacheonly list updates >"${output_file}" 2>/dev/null
+    rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        emit_error 'PACKAGE_CHECK_TIMEOUT' 'YUM package check exceeded the configured timeout.'
+        return 1
+    fi
+    if (( rc != 0 )); then
+        emit_error 'PACKAGE_CHECK_FAILED' 'YUM was unable to determine available package updates from cached metadata.'
+        return 1
+    fi
+
+    SECURITY_STATUS='unknown'
+
+    while read -r pkgarch available repository _; do
+        [[ "${pkgarch:-}" == *.* && -n "${available:-}" ]] || continue
+
+        name=${pkgarch%.*}
+        arch=${pkgarch##*.}
+        installed=$(rpm_installed_version "${name}" "${arch}")
+
+        append_package "${name}" "${arch}" "${installed}" "${available}" "${repository:-unknown}" 'null'
+    done < "${output_file}"
+}
+
+detect_reboot_status() {
+    local needs_restarting=''
+
+    if [[ -e '/var/run/reboot-required' ]]; then
+        REBOOT_REQUIRED='true'
+        REBOOT_STATUS='known'
+        return 0
+    fi
+
+    case "${PACKAGE_MANAGER}" in
+        apt)
+            REBOOT_REQUIRED='null'
+            REBOOT_STATUS='unknown'
+            ;;
+        dnf5)
+            if "${DNF5}" needs-restarting --help >/dev/null 2>&1; then
+                run_with_timeout "${DNF5}" -q needs-restarting -r >/dev/null 2>&1
+                local rc=$?
+                if (( rc == 0 )); then
+                    REBOOT_REQUIRED='false'
+                    REBOOT_STATUS='known'
+                elif (( rc == 1 )); then
+                    REBOOT_REQUIRED='true'
+                    REBOOT_STATUS='known'
+                fi
+            fi
+            ;;
+        dnf|yum)
+            if needs_restarting=$(command -v needs-restarting 2>/dev/null); then
+                run_with_timeout "${needs_restarting}" -r >/dev/null 2>&1
+                local rc=$?
+                if (( rc == 0 )); then
+                    REBOOT_REQUIRED='false'
+                    REBOOT_STATUS='known'
+                elif (( rc == 1 )); then
+                    REBOOT_REQUIRED='true'
+                    REBOOT_STATUS='known'
+                fi
+            fi
+            ;;
+    esac
+}
+
+emit_packages_array() {
+    local first='yes'
+    local name arch installed available repository security
+
+    printf '['
+    while IFS=$'\t' read -r name arch installed available repository security || [[ -n "${name:-}" ]]; do
+        [[ -n "${name:-}" ]] || continue
+
+        if [[ "${first}" == 'yes' ]]; then
+            first='no'
+        else
+            printf ','
+        fi
+
+        printf '{'
+        printf '"name":"%s",' "$(json_escape "${name}")"
+        printf '"architecture":"%s",' "$(json_escape "${arch}")"
+        printf '"installed":'
+        json_string_or_null "${installed}"
+        printf ','
+        printf '"available":"%s",' "$(json_escape "${available}")"
+        printf '"repository":"%s",' "$(json_escape "${repository}")"
+        printf '"security":%s' "${security}"
+        printf '}'
+    done < "${PACKAGES_FILE}"
+    printf ']'
+}
+
+emit_success() {
+    local total security_total=0
+    total=$(wc -l < "${PACKAGES_FILE}")
+    total=$(trim "${total}")
+
+    if [[ "${SECURITY_STATUS}" == 'supported' || "${SECURITY_STATUS}" == 'heuristic' ]]; then
+        security_total=$(awk -F '\t' '$6 == "true" { count++ } END { print count+0 }' "${PACKAGES_FILE}")
+    fi
+
+    LAST_CHECK=$(date +%s)
+
+    printf '{'
+    printf '"schema_version":%d,' "${SCHEMA_VERSION}"
+    printf '"status":"ok",'
+    printf '"collector_version":"%s",' "$(json_escape "${PROGRAM_VERSION}")"
+    printf '"timestamp":%s,' "${LAST_CHECK}"
+
+    printf '"distribution":{'
+    printf '"id":"%s",' "$(json_escape "${OS_ID}")"
+    printf '"name":"%s",' "$(json_escape "${OS_NAME}")"
+    printf '"version":"%s"' "$(json_escape "${OS_VERSION}")"
+    printf '},'
+
+    printf '"package_manager":"%s",' "$(json_escape "${PACKAGE_MANAGER}")"
+    if [[ "${REFRESH_ENABLED}" == 'yes' ]]; then
+        printf '"refresh_enabled":true,'
+    else
+        printf '"refresh_enabled":false,'
+    fi
+    printf '"refresh_interval":%s,' "${REFRESH_INTERVAL}"
+
+    printf '"updates":{'
+    printf '"total":%s,' "${total}"
+    if [[ "${SECURITY_STATUS}" == 'supported' || "${SECURITY_STATUS}" == 'heuristic' ]]; then
+        printf '"security":%s,' "${security_total}"
+    else
+        printf '"security":null,'
+    fi
+    printf '"security_status":"%s"' "$(json_escape "${SECURITY_STATUS}")"
+    printf '},'
+
+    printf '"reboot_required":%s,' "${REBOOT_REQUIRED}"
+    printf '"reboot_status":"%s",' "$(json_escape "${REBOOT_STATUS}")"
+    printf '"last_refresh":%s,' "${LAST_REFRESH}"
+    printf '"last_check":%s,' "${LAST_CHECK}"
+    printf '"packages":'
+    emit_packages_array
+    printf '}\n'
+}
+
+main() {
+    local now
+
+    if (( $# != 0 )); then
+        emit_error 'INVALID_ARGUMENTS' 'This collector does not accept command-line arguments.'
+        return 64
+    fi
+
+    if (( EUID != 0 )); then
+        emit_error 'ROOT_REQUIRED' 'The collector must run as root through the restricted sudo rule.'
+        return 77
+    fi
+
+    find_binary STAT_BIN stat || {
+        emit_error 'DEPENDENCY_MISSING' 'Required command not found: stat.'
+        return 69
+    }
+    find_binary READLINK_BIN readlink || {
+        emit_error 'DEPENDENCY_MISSING' 'Required command not found: readlink.'
+        return 69
+    }
+
+    if ! validate_self_security; then
+        return 77
+    fi
+
+    if ! load_config; then
+        return 78
+    fi
+
+    if [[ "${CHECK_ENABLED}" != 'yes' ]]; then
+        emit_disabled
+        return 0
+    fi
+
+    find_binary TIMEOUT_BIN timeout || {
+        emit_error 'DEPENDENCY_MISSING' 'Required command not found: timeout.'
+        return 69
+    }
+ 
