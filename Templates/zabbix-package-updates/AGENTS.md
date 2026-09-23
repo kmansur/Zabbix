@@ -6,7 +6,7 @@
 
 The project must support multiple Linux distributions and must keep monitoring separate from privileged remediation.
 
-The primary purpose of the project is **monitoring and visibility**. Package installation or remediation may be implemented later as an optional feature, but it must always be explicitly enabled, tightly restricted, locally authorized, and auditable.
+The primary purpose of the project is **monitoring and visibility**. Arbitrary package installation, package removal, and generic package-management execution are explicitly out of scope. A future remediation feature may only apply updates already offered by the host's configured and trusted repositories, and it must always be explicitly enabled, tightly restricted, locally authorized, and auditable.
 
 ---
 
@@ -596,7 +596,7 @@ APPLY
 
 Monitoring must work when remediation is completely disabled.
 
-The default installation must provide monitoring without granting package-installation capability.
+The default installation must provide monitoring without granting package-update application capability.
 
 Do not require remediation permissions merely to collect package-update information unless a specific package manager makes a narrowly scoped privileged read/refresh operation necessary.
 
@@ -614,7 +614,7 @@ APPLY_ALL_ENABLED=no
 AUTO_REBOOT=no
 ```
 
-A fresh installation must never automatically install packages.
+A fresh installation must never automatically apply package updates.
 
 Remediation must always be opt-in.
 
@@ -661,7 +661,7 @@ A compromised Zabbix Server must not automatically gain package-update privilege
 
 # 19. Automatic Remediation
 
-Do not enable automatic package installation directly from a Zabbix trigger by default.
+Do not enable automatic package updates directly from a Zabbix trigger by default.
 
 Avoid designs such as:
 
@@ -1436,7 +1436,7 @@ A feature is complete when:
 
 The guiding security principle is:
 
-> Zabbix may request information or an explicitly authorized package-management action, but it must never receive a general-purpose privileged execution capability.
+> Zabbix may request information or an explicitly authorized package-update action, but it must never receive arbitrary package installation/removal capability or a general-purpose privileged execution capability.
 
 Monitoring must remain safe by default.
 
