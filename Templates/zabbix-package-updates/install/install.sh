@@ -1,204 +1,158 @@
 #!/usr/bin/env bash
-#
-# install.sh
-#
 # Secure installer for zabbix-package-updates.
-#
+# It does not install operating-system packages.
 
 set -euo pipefail
-
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
-export PATH
-LC_ALL='C'
-LANG='C'
-export LC_ALL LANG
+LC_ALL=C
+LANG=C
+export PATH LC_ALL LANG
 umask 027
 
-readonly PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-readonly SOURCE_COLLECTOR="${PROJECT_ROOT}/scripts/zabbix-package-updates"
-readonly SOURCE_CONFIG="${PROJECT_ROOT}/config/zabbix-package-updates.conf.example"
-readonly SOURCE_SUDOERS="${PROJECT_ROOT}/config/sudoers.example"
-readonly SOURCE_USERPARAMETER="${PROJECT_ROOT}/config/userparameter.conf"
-
-readonly TARGET_SCRIPT_DIR='/usr/local/scripts'
+readonly TARGET_DIR='/usr/local/scripts'
 readonly TARGET_COLLECTOR='/usr/local/scripts/zabbix-package-updates'
 readonly TARGET_CONFIG='/etc/zabbix-package-updates.conf'
 readonly TARGET_SUDOERS='/etc/sudoers.d/zabbix-package-updates'
-readonly BACKUP_DIR='/var/backups/zabbix-package-updates'
 
-info() {
-    printf '==> %s\n' "$*"
-}
+info() { printf '==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-warn() {
-    printf 'WARNING: %s\n' "$*" >&2
-}
-
-die() {
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
-}
-
-require_regular_file() {
-    local file=$1
-    [[ -f "${file}" && ! -L "${file}" ]] || die "Required source file is missing or unsafe: ${file}"
+secure_dir() {
+    local dir=$1 owner mode
+    [[ ! -L "$dir" ]] || die "Refusing symbolic-link directory: $dir"
+    install -d -o root -g root -m 0755 "$dir"
+    owner=$(stat -c '%u' "$dir"); mode=$(stat -c '%A' "$dir")
+    [[ $owner == 0 && ${mode:5:1} != w && ${mode:8:1} != w ]] || \
+        die "$dir must be root-owned and not group/other writable."
 }
 
 backup_file() {
-    local file=$1
-    local stamp
-
-    [[ -e "${file}" ]] || return 0
-    [[ ! -L "${file}" ]] || die "Refusing to overwrite symbolic link: ${file}"
-
-    stamp=$(date '+%Y%m%d-%H%M%S')
-    install -d -o root -g root -m 0700 "${BACKUP_DIR}"
-    cp -p -- "${file}" "${BACKUP_DIR}/$(basename -- "${file}").${stamp}"
-    info "Backup created for ${file}"
+    local file=$1 backup_dir='/var/backups/zabbix-package-updates'
+    [[ -e "$file" ]] || return 0
+    [[ ! -L "$file" ]] || die "Refusing to overwrite symbolic link: $file"
+    install -d -o root -g root -m 0700 "$backup_dir"
+    cp -a -- "$file" "$backup_dir/$(basename "$file").$(date +%Y%m%d%H%M%S)"
 }
 
-install_userparameter() {
-    local installed='no'
-    local directory target
-
-    for directory in \
-        /etc/zabbix/zabbix_agent2.d \
-        /etc/zabbix/zabbix_agentd.d
-    do
-        [[ -d "${directory}" && ! -L "${directory}" ]] || continue
-
-        target="${directory}/zabbix-package-updates.conf"
-        backup_file "${target}"
-        install -o root -g root -m 0644 "${SOURCE_USERPARAMETER}" "${target}"
-        info "Installed Agent integration: ${target}"
-        installed='yes'
-    done
-
-    [[ "${installed}" == 'yes' ]] || die 'No supported Zabbix Agent include directory was found.'
+find_source_root() {
+    local root
+    root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+    [[ -f "$root/scripts/zabbix-package-updates" ]] || die 'Collector source file was not found.'
+    [[ -f "$root/config/zabbix-package-updates.conf.example" ]] || die 'Configuration example was not found.'
+    [[ -f "$root/config/sudoers.example" ]] || die 'sudoers example was not found.'
+    [[ -f "$root/config/userparameter.conf" ]] || die 'UserParameter example was not found.'
+    printf '%s' "$root"
 }
 
-validate_sudoers() {
-    command -v visudo >/dev/null 2>&1 || die 'visudo is required to validate the restricted sudoers rule.'
-    visudo -cf "${TARGET_SUDOERS}" >/dev/null || die 'The installed sudoers rule failed validation.'
+detect_agent() {
+    local a2_conf='/etc/zabbix/zabbix_agent2.conf' a_conf='/etc/zabbix/zabbix_agentd.conf'
+    local a2_dir='/etc/zabbix/zabbix_agent2.d' a_dir='/etc/zabbix/zabbix_agentd.d'
+
+    if [[ -f "$a2_conf" && ! -f "$a_conf" ]]; then
+        AGENT_CONF=$a2_conf; AGENT_DIR=$a2_dir; AGENT_BIN=$(command -v zabbix_agent2 || true); AGENT_SERVICE=zabbix-agent2
+    elif [[ -f "$a_conf" && ! -f "$a2_conf" ]]; then
+        AGENT_CONF=$a_conf; AGENT_DIR=$a_dir; AGENT_BIN=$(command -v zabbix_agentd || true); AGENT_SERVICE=zabbix-agent
+    elif [[ -f "$a2_conf" && -f "$a_conf" ]]; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zabbix-agent2; then
+            AGENT_CONF=$a2_conf; AGENT_DIR=$a2_dir; AGENT_BIN=$(command -v zabbix_agent2 || true); AGENT_SERVICE=zabbix-agent2
+        elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zabbix-agent; then
+            AGENT_CONF=$a_conf; AGENT_DIR=$a_dir; AGENT_BIN=$(command -v zabbix_agentd || true); AGENT_SERVICE=zabbix-agent
+        else
+            die 'Both Zabbix Agent and Agent 2 configurations exist and the active agent cannot be determined.'
+        fi
+    else
+        die 'Zabbix Agent or Zabbix Agent 2 is required before installing this project.'
+    fi
+
+    [[ -n "$AGENT_BIN" ]] || die 'The selected Zabbix Agent binary was not found in PATH.'
+    [[ -d "$AGENT_DIR" ]] || install -d -o root -g root -m 0755 "$AGENT_DIR"
+}
+
+validate_agent_include() {
+    local escaped=${AGENT_DIR//\//\\/}
+    if ! grep -Eq "^[[:space:]]*Include[[:space:]]*=[[:space:]]*${escaped}/?\\*\\.conf[[:space:]]*$" "$AGENT_CONF"; then
+        die "The selected agent configuration does not include ${AGENT_DIR}/*.conf."
+    fi
+}
+
+install_atomic() {
+    local source=$1 target=$2 mode=$3 dir tmp
+    dir=${target%/*}
+    tmp=$(mktemp "${dir}/.zpu.XXXXXX")
+    install -o root -g root -m "$mode" "$source" "$tmp"
+    mv -f -- "$tmp" "$target"
+}
+
+install_sudoers() {
+    command -v sudo >/dev/null 2>&1 || die 'sudo is required.'
+    command -v visudo >/dev/null 2>&1 || die 'visudo is required.'
+    [[ -d /etc/sudoers.d ]] || die '/etc/sudoers.d is unavailable.'
+    grep -Eq '^[[:space:]]*[@#]includedir[[:space:]]+/etc/sudoers\.d([[:space:]]|$)' /etc/sudoers || \
+        die '/etc/sudoers does not include /etc/sudoers.d.'
+
+    local tmp
+    tmp=$(mktemp /etc/sudoers.d/.zpu.XXXXXX)
+    printf '%s\n' 'zabbix ALL=(root) NOPASSWD: /usr/local/scripts/zabbix-package-updates ""' > "$tmp"
+    chmod 0440 "$tmp"; chown root:root "$tmp"
+    visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die 'Generated sudoers rule failed validation.'; }
+    backup_file "$TARGET_SUDOERS"
+    mv -f -- "$tmp" "$TARGET_SUDOERS"
+    visudo -c >/dev/null || die 'Global sudoers validation failed after installation.'
 }
 
 reload_agent() {
-    local reloaded='no'
-
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet zabbix-agent2 2>/dev/null; then
-            if command -v zabbix_agent2 >/dev/null 2>&1 &&
-               zabbix_agent2 -c /etc/zabbix/zabbix_agent2.conf -R userparameter_reload >/dev/null 2>&1; then
-                info 'Reloaded Zabbix Agent 2 UserParameters.'
-            else
-                systemctl restart zabbix-agent2
-                info 'Restarted zabbix-agent2.'
-            fi
-            reloaded='yes'
-        fi
-
-        if systemctl is-active --quiet zabbix-agent 2>/dev/null; then
-            if command -v zabbix_agentd >/dev/null 2>&1 &&
-               zabbix_agentd -c /etc/zabbix/zabbix_agentd.conf -R userparameter_reload >/dev/null 2>&1; then
-                info 'Reloaded Zabbix Agent UserParameters.'
-            else
-                systemctl restart zabbix-agent
-                info 'Restarted zabbix-agent.'
-            fi
-            reloaded='yes'
-        fi
+    if "$AGENT_BIN" -c "$AGENT_CONF" -R userparameter_reload >/dev/null 2>&1; then
+        info 'UserParameters reloaded.'
+        return 0
     fi
-
-    [[ "${reloaded}" == 'yes' ]] || warn 'No active Zabbix Agent service was detected. Reload/restart it manually if necessary.'
-}
-
-test_collector() {
-    local output
-
-    info 'Testing collector directly as root...'
-    output=$("${TARGET_COLLECTOR}") || {
-        printf '%s\n' "${output}" >&2
-        die 'Collector test failed.'
-    }
-
-    [[ "${output}" == \{*\} ]] || die 'Collector did not return JSON-like output.'
-    printf '%s\n' "${output}" | grep -q '"schema_version":1' || die 'Collector returned an unexpected schema.'
-    printf '%s\n' "${output}" | grep -q '"status":"ok"\|"status":"disabled"' || die 'Collector did not return a successful monitoring state.'
-
-    if id zabbix >/dev/null 2>&1; then
-        info 'Testing restricted execution as the zabbix account...'
-        output=$(sudo -u zabbix sudo -n -- "${TARGET_COLLECTOR}") || {
-            printf '%s\n' "${output}" >&2
-            die 'Restricted zabbix sudo execution test failed.'
-        }
-        printf '%s\n' "${output}" | grep -q '"schema_version":1' || die 'Zabbix execution returned an unexpected schema.'
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_SERVICE"; then
+        systemctl restart "$AGENT_SERVICE"
+        info "Restarted $AGENT_SERVICE."
     else
-        die 'The zabbix service account does not exist.'
+        warn 'Agent is not active; start/reload it before using the template.'
     fi
 }
 
 main() {
     (( $# == 0 )) || die 'This installer does not accept command-line arguments.'
-    (( EUID == 0 )) || die 'This installer must be run as root.'
+    (( EUID == 0 )) || die 'Run this installer as root.'
 
-    require_regular_file "${SOURCE_COLLECTOR}"
-    require_regular_file "${SOURCE_CONFIG}"
-    require_regular_file "${SOURCE_SUDOERS}"
-    require_regular_file "${SOURCE_USERPARAMETER}"
+    local root snippet
+    root=$(find_source_root)
+    detect_agent
+    validate_agent_include
+    secure_dir "$TARGET_DIR"
 
-    command -v sudo >/dev/null 2>&1 || die 'sudo is required.'
-    command -v timeout >/dev/null 2>&1 || die 'timeout is required (normally provided by coreutils).'
-    command -v flock >/dev/null 2>&1 || die 'flock is required (normally provided by util-linux).'
-    command -v stat >/dev/null 2>&1 || die 'stat is required.'
-    command -v readlink >/dev/null 2>&1 || die 'readlink is required.'
+    bash -n "$root/scripts/zabbix-package-updates" || die 'Collector syntax validation failed.'
+    backup_file "$TARGET_COLLECTOR"
+    install_atomic "$root/scripts/zabbix-package-updates" "$TARGET_COLLECTOR" 0755
 
-    id zabbix >/dev/null 2>&1 || die 'The zabbix service account was not found.'
-
-    if [[ -e "${TARGET_SCRIPT_DIR}" ]]; then
-        [[ -d "${TARGET_SCRIPT_DIR}" && ! -L "${TARGET_SCRIPT_DIR}" ]] ||
-            die "${TARGET_SCRIPT_DIR} exists but is not a safe directory."
+    if [[ ! -e "$TARGET_CONFIG" ]]; then
+        install_atomic "$root/config/zabbix-package-updates.conf.example" "$TARGET_CONFIG" 0640
     else
-        install -d -o root -g root -m 0755 "${TARGET_SCRIPT_DIR}"
-        info "Created ${TARGET_SCRIPT_DIR}"
+        [[ -f "$TARGET_CONFIG" && ! -L "$TARGET_CONFIG" ]] || die 'Existing configuration is not a safe regular file.'
+        chown root:root "$TARGET_CONFIG"
+        chmod 0640 "$TARGET_CONFIG"
+        info 'Existing local configuration preserved.'
     fi
 
-    local dir_owner dir_mode
-    dir_owner=$(stat -c '%u' -- "${TARGET_SCRIPT_DIR}")
-    dir_mode=$(stat -c '%a' -- "${TARGET_SCRIPT_DIR}")
-    [[ "${dir_owner}" == '0' ]] || die "${TARGET_SCRIPT_DIR} must be owned by root."
-    (( (8#${dir_mode} & 8#022) == 0 )) || die "${TARGET_SCRIPT_DIR} must not be writable by group or others."
+    install_sudoers
 
-    backup_file "${TARGET_COLLECTOR}"
-    install -o root -g root -m 0755 "${SOURCE_COLLECTOR}" "${TARGET_COLLECTOR}"
-    info "Installed collector: ${TARGET_COLLECTOR}"
+    snippet="$AGENT_DIR/zabbix-package-updates.conf"
+    backup_file "$snippet"
+    install_atomic "$root/config/userparameter.conf" "$snippet" 0644
 
-    if [[ ! -e "${TARGET_CONFIG}" ]]; then
-        install -o root -g root -m 0640 "${SOURCE_CONFIG}" "${TARGET_CONFIG}"
-        info "Installed default configuration: ${TARGET_CONFIG}"
-    else
-        [[ -f "${TARGET_CONFIG}" && ! -L "${TARGET_CONFIG}" ]] ||
-            die "Refusing unsafe existing configuration: ${TARGET_CONFIG}"
-        info "Preserved existing configuration: ${TARGET_CONFIG}"
+    "$AGENT_BIN" -c "$AGENT_CONF" -T >/dev/null || die 'Zabbix Agent configuration validation failed.'
+
+    if ! sudo -u zabbix -- sudo -n -- "$TARGET_COLLECTOR" >/dev/null; then
+        die 'Collector test through the restricted sudo rule failed.'
     fi
 
-    backup_file "${TARGET_SUDOERS}"
-    install -o root -g root -m 0440 "${SOURCE_SUDOERS}" "${TARGET_SUDOERS}"
-    validate_sudoers
-    info "Installed restricted sudoers rule: ${TARGET_SUDOERS}"
-
-    install_userparameter
-
-    install -d -o root -g root -m 0750 /var/cache/zabbix-package-updates
-    install -d -o root -g root -m 0750 /run/zabbix-package-updates
-
-    test_collector
     reload_agent
-
-    printf '\nInstallation completed successfully.\n'
-    printf 'Collector : %s\n' "${TARGET_COLLECTOR}"
-    printf 'Config    : %s\n' "${TARGET_CONFIG}"
-    printf 'Zabbix key: linux.package.updates\n'
-    printf '\nNo package installation or update application capability was enabled.\n'
+    info "Installed collector: $TARGET_COLLECTOR"
+    info "Installed UserParameter: $snippet"
+    info 'No packages were installed, removed or upgraded by this installer.'
 }
 
 main "$@"
