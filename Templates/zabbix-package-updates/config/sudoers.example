@@ -1,0 +1,9 @@
+# zabbix-package-updates
+#
+# Permit the zabbix service account to execute only the project collector
+# as root and only without command-line arguments.
+#
+# The empty argument string ("") is intentional. In sudoers it means that
+# this command is allowed only when no arguments are supplied.
+
+zabbix ALL=(root) NOPASSWD: /usr/local/scripts/zabbix-package-updates ""
