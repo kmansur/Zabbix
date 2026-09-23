@@ -277,4 +277,252 @@ validate_secure_file() {
         return 1
     }
 
-    mode_string=$("${STAT_BIN}" -c '
+    mode_string=$("${STAT_BIN}" -c '%A' -- "${file}" 2>/dev/null) || {
+        emit_error 'INSECURE_FILE' "Unable to verify ${description} permissions."
+        return 1
+    }
+
+    if [[ "${owner}" != '0' ]]; then
+        emit_error 'INSECURE_FILE' "${description} must be owned by root."
+        return 1
+    fi
+
+    if [[ ${#mode_string} -lt 10 || ${mode_string:5:1} == 'w' || ${mode_string:8:1} == 'w' ]]; then
+        emit_error 'INSECURE_FILE' "${description} must not be writable by group or others."
+        return 1
+    fi
+}
+
+validate_self_security() {
+    local script_path parent
+
+    script_path=$("${READLINK_BIN}" -f -- "$0" 2>/dev/null) || {
+        emit_error 'INSECURE_COLLECTOR' 'Unable to resolve collector path.'
+        return 1
+    }
+
+    validate_secure_file "${script_path}" 'Collector executable' || return 1
+
+    parent=${script_path%/*}
+    [[ -n "${parent}" && "${parent}" != "${script_path}" ]] || {
+        emit_error 'INSECURE_COLLECTOR' 'Unable to determine collector directory.'
+        return 1
+    }
+
+    local owner mode_string
+    owner=$("${STAT_BIN}" -c '%u' -- "${parent}" 2>/dev/null) || {
+        emit_error 'INSECURE_COLLECTOR' 'Unable to verify collector directory ownership.'
+        return 1
+    }
+    mode_string=$("${STAT_BIN}" -c '%A' -- "${parent}" 2>/dev/null) || {
+        emit_error 'INSECURE_COLLECTOR' 'Unable to verify collector directory permissions.'
+        return 1
+    }
+
+    if [[ "${owner}" != '0' || ${#mode_string} -lt 10 || ${mode_string:5:1} == 'w' || ${mode_string:8:1} == 'w' ]]; then
+        emit_error 'INSECURE_COLLECTOR' 'Collector directory must be root-owned and not writable by group or others.'
+        return 1
+    fi
+}
+
+prepare_directories() {
+    if [[ -L "${CACHE_DIR}" || -L "${RUNTIME_DIR}" ]]; then
+        emit_error 'INSECURE_DIRECTORY' 'Collector state directories must not be symbolic links.'
+        return 1
+    fi
+
+    mkdir -p -- "${CACHE_DIR}" "${RUNTIME_DIR}" || {
+        emit_error 'DIRECTORY_CREATE_FAILED' 'Unable to create collector state directories.'
+        return 1
+    }
+
+    chown root:root "${CACHE_DIR}" "${RUNTIME_DIR}" 2>/dev/null || {
+        emit_error 'DIRECTORY_OWNERSHIP_FAILED' 'Unable to secure collector state directories.'
+        return 1
+    }
+
+    chmod 0750 "${CACHE_DIR}" "${RUNTIME_DIR}" || {
+        emit_error 'DIRECTORY_PERMISSION_FAILED' 'Unable to secure collector state directories.'
+        return 1
+    }
+}
+
+prepare_work_files() {
+    WORK_DIR=$(mktemp -d "${RUNTIME_DIR}/work.XXXXXX") || {
+        emit_error 'TEMP_CREATE_FAILED' 'Unable to create a private working directory.'
+        return 1
+    }
+    chmod 0700 "${WORK_DIR}" || return 1
+
+    PACKAGES_FILE="${WORK_DIR}/packages.tsv"
+    SECURITY_KEYS_FILE="${WORK_DIR}/security-keys.txt"
+
+    : > "${PACKAGES_FILE}"
+    : > "${SECURITY_KEYS_FILE}"
+    chmod 0600 "${PACKAGES_FILE}" "${SECURITY_KEYS_FILE}"
+}
+
+cleanup() {
+    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
+        rm -rf -- "${WORK_DIR}"
+    fi
+}
+
+read_os_release() {
+    local file='/etc/os-release'
+    local line key value
+
+    [[ -r "${file}" ]] || {
+        emit_error 'OS_RELEASE_UNAVAILABLE' 'Unable to read /etc/os-release.'
+        return 1
+    }
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" || ${line:0:1} == '#' || "${line}" != *'='* ]] && continue
+        key=${line%%=*}
+        value=${line#*=}
+        value=$(strip_optional_quotes "${value}")
+
+        case "${key}" in
+            ID) OS_ID=${value} ;;
+            NAME) OS_NAME=${value} ;;
+            VERSION_ID) OS_VERSION=${value} ;;
+            ID_LIKE) OS_ID_LIKE=${value} ;;
+        esac
+    done < "${file}"
+
+    [[ -n "${OS_ID}" ]] || OS_ID='unknown'
+    [[ -n "${OS_NAME}" ]] || OS_NAME="${OS_ID}"
+    [[ -n "${OS_VERSION}" ]] || OS_VERSION='unknown'
+}
+
+detect_package_manager() {
+    local identity=" ${OS_ID} ${OS_ID_LIKE} "
+
+    if [[ "${identity}" == *' debian '* || "${OS_ID}" == 'ubuntu' || "${OS_ID}" == 'linuxmint' ]]; then
+        find_binary APT_GET apt-get || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'apt-get was not found.'
+            return 1
+        }
+        find_binary APT apt || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'apt was not found.'
+            return 1
+        }
+        find_binary DPKG_QUERY dpkg-query || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'dpkg-query was not found.'
+            return 1
+        }
+        PACKAGE_MANAGER='apt'
+        return 0
+    fi
+
+    if [[ "${identity}" == *' rhel '* || "${identity}" == *' fedora '* || "${identity}" == *' centos '* ||
+          "${OS_ID}" == 'rocky' || "${OS_ID}" == 'almalinux' || "${OS_ID}" == 'ol' ]]; then
+        find_binary RPM rpm || {
+            emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'rpm was not found.'
+            return 1
+        }
+
+        if find_binary DNF5 dnf5; then
+            PACKAGE_MANAGER='dnf5'
+            return 0
+        fi
+        if find_binary DNF dnf; then
+            PACKAGE_MANAGER='dnf'
+            return 0
+        fi
+        if find_binary YUM yum; then
+            PACKAGE_MANAGER='yum'
+            return 0
+        fi
+
+        emit_error 'PACKAGE_MANAGER_NOT_FOUND' 'No supported RPM package manager was found.'
+        return 1
+    fi
+
+    emit_error 'UNSUPPORTED_DISTRIBUTION' "Unsupported Linux distribution: ${OS_ID}."
+    return 1
+}
+
+detect_platform_variant() {
+    local pveversion='' version=''
+
+    if [[ "${PACKAGE_MANAGER}" == 'apt' && -x '/usr/bin/pveversion' ]]; then
+        pveversion=$(/usr/bin/pveversion 2>/dev/null | head -n 1 || true)
+        if [[ "${pveversion}" == pve-manager/* ]]; then
+            version=${pveversion#pve-manager/}
+            version=${version%%/*}
+            OS_ID='proxmox'
+            OS_NAME='Proxmox VE'
+            [[ -n "${version}" ]] && OS_VERSION=${version}
+        fi
+    fi
+}
+
+read_last_refresh() {
+    local value=0
+
+    if [[ -f "${LAST_REFRESH_FILE}" ]]; then
+        IFS= read -r value < "${LAST_REFRESH_FILE}" || value=0
+        [[ "${value}" =~ ^[0-9]+$ ]] || value=0
+    fi
+
+    LAST_REFRESH=${value}
+}
+
+write_last_refresh() {
+    local timestamp=$1
+    local temporary
+
+    temporary=$(mktemp "${CACHE_DIR}/last_refresh.XXXXXX") || return 1
+    chmod 0640 "${temporary}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+
+    printf '%s\n' "${timestamp}" > "${temporary}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+
+    mv -f -- "${temporary}" "${LAST_REFRESH_FILE}" || {
+        rm -f -- "${temporary}"
+        return 1
+    }
+
+    LAST_REFRESH=${timestamp}
+}
+
+refresh_is_due() {
+    local now=$1
+
+    (( LAST_REFRESH == 0 )) && return 0
+    (( now - LAST_REFRESH >= REFRESH_INTERVAL ))
+}
+
+run_with_timeout() {
+    "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${COMMAND_TIMEOUT}" "$@"
+}
+
+refresh_metadata() {
+    local output_file="${WORK_DIR}/refresh-output.log"
+    local rc now
+
+    case "${PACKAGE_MANAGER}" in
+        apt)
+            DEBIAN_FRONTEND=noninteractive run_with_timeout \
+                "${APT_GET}" -o Dpkg::Use-Pty=0 -o APT::Update::Error-Mode=any update \
+                >"${output_file}" 2>&1
+            rc=$?
+            ;;
+        dnf5)
+            run_with_timeout "${DNF5}" -q makecache --refresh >"${output_file}" 2>&1
+            rc=$?
+            ;;
+        dnf)
+            run_with_timeout "${DNF}" -q makecache --refresh >"${output_file}" 2>&1
+            rc=$?
+            ;;
+        yum)
+            run_with_timeout "${YUM}" -q makecache fast >"${output_file}" 2>&1
+            
