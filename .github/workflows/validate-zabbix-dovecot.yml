@@ -1,0 +1,32 @@
+name: Validate zabbix-dovecot
+
+on:
+  push:
+    paths:
+      - 'Templates/zabbix-dovecot/**'
+      - '.github/workflows/validate-zabbix-dovecot.yml'
+  pull_request:
+    paths:
+      - 'Templates/zabbix-dovecot/**'
+      - '.github/workflows/validate-zabbix-dovecot.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install validation dependency
+        run: python -m pip install --disable-pip-version-check PyYAML
+      - name: Validate shell syntax
+        run: sh -n Templates/zabbix-dovecot/scripts/zabbix-dovecot
+      - name: Run collector tests
+        run: sh Templates/zabbix-dovecot/tests/test_core.sh
+      - name: Validate templates
+        run: python Templates/zabbix-dovecot/tests/validate_templates.py
